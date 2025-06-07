@@ -1,0 +1,213 @@
+YOLO-NAS
+YOLO-NAS（You Only Look Once - Neural Architecture Search）はDeci.aiによって開発された高速・高精度な物体検出モデルです。以下に、YOLO-NASを使った学習と推論の最小限サンプルコードを示します。
+
+⸻
+
+🔧 前提条件
+	•	Python >= 3.8
+	•	GPU (推奨)
+	•	super-gradients ライブラリを使用（YOLO-NASの公式サポート）
+
+pip install super-gradients
+
+
+⸻
+
+📁 データ構造（例: Pascal VOCフォーマット）
+
+dataset/
+├── train/
+│   ├── images/
+│   └── annotations/
+├── valid/
+│   ├── images/
+│   └── annotations/
+
+YOLOフォーマットでも可（txt + images）です。
+
+⸻
+
+🧠 学習コード
+
+from super_gradients.training import Trainer, dataloaders
+from super_gradients.training.models import yolo_nas_l
+from super_gradients.training.datasets.detection_datasets import COCOFormatDetectionDataset
+from super_gradients.training.losses import PPYoloELoss
+from super_gradients.training.metrics import DetectionMetrics
+
+# トレーナーの初期化
+trainer = Trainer(experiment_name="yolo_nas_example")
+
+# データセット設定（Pascal VOC or YOLO形式）
+train_dataset = COCOFormatDetectionDataset(
+    data_dir="dataset/train", json_annotation_file="instances_train.json", dataset_classes=["person", "car"]
+)
+
+val_dataset = COCOFormatDetectionDataset(
+    data_dir="dataset/valid", json_annotation_file="instances_valid.json", dataset_classes=["person", "car"]
+)
+
+# Dataloader作成
+train_loader = dataloaders.get(
+    name="coco_format_detection", dataset=train_dataset, batch_size=8, num_workers=4, shuffle=True
+)
+val_loader = dataloaders.get(
+    name="coco_format_detection", dataset=val_dataset, batch_size=8, num_workers=4, shuffle=False
+)
+
+# モデル作成
+model = yolo_nas_l(num_classes=2, pretrained_weights="coco")
+
+# 学習実行
+trainer.train(
+    model=model,
+    training_params={
+        "max_epochs": 30,
+        "initial_lr": 0.01,
+        "loss": PPYoloELoss(),
+        "metric": DetectionMetrics(num_classes=2),
+        "train_loader": train_loader,
+        "valid_loader": val_loader,
+        "save_checkpoints": True,
+        "checkpoint_dir": "checkpoints/",
+    },
+)
+
+
+⸻
+
+🔍 推論コード
+
+from super_gradients.training.models import get
+from super_gradients.training.utils.predict import predict
+from PIL import Image
+
+# モデル読み込み（保存したチェックポイントを使用）
+model = get("yolo_nas_l", num_classes=2)
+model.load_weights("checkpoints/ckpt_best.pth")  # 保存された重みパス
+
+# 推論画像
+image = Image.open("sample.jpg")
+
+# 推論
+predictions = predict(model=model, images=[image], class_names=["person", "car"])
+predictions.show()
+
+
+⸻
+
+💡 備考
+	•	super-gradientsは公式がYOLO-NAS専用に用意しているため、PyTorchベースのラッパーライブラリになっています。
+	•	独自データセットを使う場合は、COCOFormatDetectionDatasetやDetectionDatasetを使って変換する必要があります。
+
+⸻
+
+了解しました。YOLO-NAS を YOLOフォーマットのデータ で学習・推論するサンプルコードを以下に提示します。
+
+⸻
+
+📁 YOLOフォーマットのディレクトリ構成
+
+dataset/
+├── train/
+│   ├── images/
+│   │   ├── xxx.jpg
+│   └── labels/
+│       ├── xxx.txt  ← YOLO形式 (class_id cx cy w h)
+├── valid/
+│   ├── images/
+│   └── labels/
+
+各 .txt ファイルは画像と同名で、行ごとに class_id cx cy w h（正規化済み, 値は0〜1）
+
+⸻
+
+🧠 学習コード（YOLOフォーマット）
+
+from super_gradients.training import Trainer
+from super_gradients.training.models import yolo_nas_l
+from super_gradients.training.dataloaders.dataloaders import yolo_detection_train_dataloader, yolo_detection_val_dataloader
+from super_gradients.training.losses import PPYoloELoss
+from super_gradients.training.metrics import DetectionMetrics
+
+# クラス定義（順序はYOLOフォーマットに合わせる）
+classes = ["person", "car"]
+
+# トレーナーの初期化
+trainer = Trainer(experiment_name="yolo_nas_yolo_format")
+
+# Dataloader 作成（YOLO形式）
+train_dataloader = yolo_detection_train_dataloader(
+    dataset_params={
+        "data_dir": "dataset/train/images",
+        "labels_dir": "dataset/train/labels",
+        "class_names": classes,
+        "input_dim": (640, 640),
+    },
+    dataloader_params={
+        "batch_size": 8,
+        "num_workers": 4,
+        "shuffle": True,
+    }
+)
+
+val_dataloader = yolo_detection_val_dataloader(
+    dataset_params={
+        "data_dir": "dataset/valid/images",
+        "labels_dir": "dataset/valid/labels",
+        "class_names": classes,
+        "input_dim": (640, 640),
+    },
+    dataloader_params={
+        "batch_size": 8,
+        "num_workers": 4,
+        "shuffle": False,
+    }
+)
+
+# モデル定義
+model = yolo_nas_l(num_classes=len(classes), pretrained_weights="coco")
+
+# 学習実行
+trainer.train(
+    model=model,
+    training_params={
+        "max_epochs": 30,
+        "initial_lr": 0.01,
+        "loss": PPYoloELoss(),
+        "metric": DetectionMetrics(num_classes=len(classes)),
+        "train_loader": train_dataloader,
+        "valid_loader": val_dataloader,
+        "save_checkpoints": True,
+        "checkpoint_dir": "checkpoints_yolo_format/",
+    },
+)
+
+
+⸻
+
+🔍 推論コード（YOLOフォーマット学習済モデル）
+
+from super_gradients.training.models import get
+from super_gradients.training.utils.predict import predict
+from PIL import Image
+
+# モデル読み込み
+model = get("yolo_nas_l", num_classes=2)
+model.load_weights("checkpoints_yolo_format/ckpt_best.pth")
+
+# 画像読み込みと推論
+image = Image.open("sample.jpg")
+predictions = predict(model=model, images=[image], class_names=["person", "car"])
+predictions.show()
+
+
+⸻
+
+✅ 補足ポイント
+	•	学習パラメータ（バッチサイズ・学習率など）は環境に応じて調整。
+	•	入力画像サイズ（640x640など）はモデルに合わせて指定（input_dim）。
+	•	推論後の .show() の他に .save() でファイル保存も可能。
+
+⸻
+
