@@ -84,4 +84,133 @@ services:
 
 ⸻
 
-ご希望であれば、それぞれの構成に合わせたDockerfileやdocker-compose.yml、FastAPI⇔Workerのコード例も出せます。どの方向で進めたいか教えてください。
+了解です！
+以下に、FastAPI（リクエスト受付側）とPython実行環境（ワーカー）をRedis + Celeryで連携させる最小限の構成サンプルを示します。
+
+⸻
+
+🧩 前提構成
+	•	FastAPI：ユーザーのリクエストを受け取ってタスクを投入
+	•	Redis：Celeryのブローカーとして使用（redis://redis:6379/0）
+	•	Celery Worker（Python）：Redisに入ったタスクを非同期で実行
+
+⸻
+
+📁 ディレクトリ構成（例）
+
+project/
+├── fastapi_app/
+│   ├── main.py
+│   └── celery_app.py
+├── worker_app/
+│   ├── tasks.py
+│   └── celery_app.py  ← 共通でもOK
+├── docker-compose.yml
+
+
+⸻
+
+🐍 1. fastapi_app/celery_app.py（共通Celery設定）
+
+from celery import Celery
+
+celery_app = Celery(
+    "worker",
+    broker="redis://redis:6379/0",
+    backend="redis://redis:6379/0",
+)
+
+
+⸻
+
+🐍 2. fastapi_app/main.py（FastAPIからタスク実行）
+
+from fastapi import FastAPI
+from fastapi.requests import Request
+from fastapi.responses import JSONResponse
+
+from celery_app import celery_app
+
+app = FastAPI()
+
+@app.post("/run-task/")
+async def run_task(request: Request):
+    data = await request.json()
+    task = celery_app.send_task("worker_app.tasks.process_job", args=[data])
+    return JSONResponse({"task_id": task.id})
+
+
+⸻
+
+🐍 3. worker_app/tasks.py（Python実行環境：処理本体）
+
+from celery_app import celery_app
+
+@celery_app.task(name="worker_app.tasks.process_job")
+def process_job(data):
+    print(f"[Worker] 処理中: {data}")
+    # 実際の処理をここに記述（例：学習、推論など）
+    return f"処理完了: {data}"
+
+
+⸻
+
+🐳 4. docker-compose.yml（Docker構成）
+
+version: "3.9"
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  fastapi:
+    build:
+      context: ./fastapi_app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: ./worker_app
+    command: celery -A tasks worker --loglevel=info
+    depends_on:
+      - redis
+
+
+⸻
+
+📦 Dockerfile（FastAPI & Worker 両方同じでOK）
+
+fastapi_app/Dockerfile & worker_app/Dockerfile：
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY . /app
+
+RUN pip install --no-cache-dir fastapi uvicorn celery redis
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+※Worker 側では CMD は使わず、docker-compose.yml で celery -A tasks worker を指定
+
+⸻
+
+✅ 動作確認
+
+curl -X POST http://localhost:8000/run-task/ \
+     -H "Content-Type: application/json" \
+     -d '{"message": "こんにちは"}'
+
+Worker 側コンテナにて：
+
+[Worker] 処理中: {'message': 'こんにちは'}
+
+
+⸻
+
