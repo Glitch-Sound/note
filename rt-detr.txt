@@ -1,0 +1,156 @@
+以下が、RT-DETR (PyTorch) を用いた学習・推論を行うための最小構成のプロジェクト構成と、必要なコード・学習データサンプルの一覧です：
+
+⸻
+
+📁 最小構成のディレクトリ構成
+
+rtdetr_minimal/
+│   train.py              # PyTorchでの学習スクリプト
+│   infer.py              # 推論スクリプト
+│   model.py              # RT-DETRモデルの読み込み
+│   dataset.py            # COCO形式データローダー
+│   requirements.txt      # 依存ライブラリ
+│
+└───data/
+    └───images/           # 入力画像（例: image1.jpg, image2.jpg）
+    └───annotations/      # COCO形式のアノテーション（例: instances_train.json）
+
+
+⸻
+
+🧱 requirements.txt
+
+torch>=2.0.0
+torchvision>=0.15.0
+pycocotools
+opencv-python
+tqdm
+
+
+⸻
+
+📦 model.py – モデル定義（hub使用）
+
+import torch
+
+def get_model(pretrained=True, num_classes=91):
+    model = torch.hub.load('lyuwenyu/RT-DETR', 'rtdetr_r50', pretrained=pretrained)
+    if num_classes != 91:
+        model.head.class_embed = torch.nn.Linear(model.head.class_embed.in_features, num_classes)
+    return model
+
+
+⸻
+
+📁 dataset.py – COCO形式のデータローダー
+
+import torch
+from torchvision.datasets import CocoDetection
+import torchvision.transforms as T
+from PIL import Image
+
+class CocoDataset(CocoDetection):
+    def __init__(self, img_dir, ann_file):
+        super().__init__(img_dir, ann_file)
+        self.transform = T.Compose([T.ToTensor()])
+
+    def __getitem__(self, idx):
+        img, anns = super().__getitem__(idx)
+        img = self.transform(img)
+        boxes = [ann['bbox'] for ann in anns]
+        labels = [ann['category_id'] for ann in anns]
+        target = {
+            'boxes': torch.tensor(boxes, dtype=torch.float32),
+            'labels': torch.tensor(labels, dtype=torch.int64)
+        }
+        return img, target
+
+
+⸻
+
+🏋️‍♀️ train.py – 学習スクリプト
+
+import torch
+from torch.utils.data import DataLoader
+from dataset import CocoDataset
+from model import get_model
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = get_model(num_classes=2).to(device)
+
+dataset = CocoDataset("data/images", "data/annotations/instances_train.json")
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=lambda x: tuple(zip(*x)))
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+model.train()
+for epoch in range(10):
+    for images, targets in dataloader:
+        images = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+        loss = sum(loss for loss in loss_dict.values())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}")
+
+torch.save(model.state_dict(), "rtdetr_minimal.pth")
+
+
+⸻
+
+🔍 infer.py – 推論スクリプト
+
+import torch
+import cv2
+from model import get_model
+import torchvision.transforms as T
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = get_model(num_classes=2, pretrained=False)
+model.load_state_dict(torch.load("rtdetr_minimal.pth", map_location=device))
+model.to(device).eval()
+
+def infer(image_path):
+    img = cv2.imread(image_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    transform = T.ToTensor()
+    input_tensor = transform(img_rgb).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(input_tensor)[0]
+
+    for box, label, score in zip(output['boxes'], output['labels'], output['scores']):
+        if score > 0.5:
+            box = box.int().cpu().numpy()
+            cv2.rectangle(img, tuple(box[:2]), tuple(box[2:]), (0, 255, 0), 2)
+            cv2.putText(img, f"{label.item()}:{score:.2f}", (box[0], box[1]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+    cv2.imwrite("inferred.jpg", img)
+
+infer("data/images/image1.jpg")
+
+
+⸻
+
+📝 学習用サンプルアノテーション（data/annotations/instances_train.json）
+
+{
+  "images": [
+    {"id": 1, "file_name": "image1.jpg", "height": 480, "width": 640}
+  ],
+  "annotations": [
+    {"id": 1, "image_id": 1, "category_id": 1, "bbox": [100, 150, 50, 80], "area": 4000, "iscrowd": 0}
+  ],
+  "categories": [
+    {"id": 1, "name": "object"}
+  ]
+}
+
+
+⸻
