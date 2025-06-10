@@ -1,0 +1,119 @@
+Vue + MapLibre 環境で、Maputnik を直接連携させてファイルのアップロード／ダウンロードを必要とせず、スタイルを即時反映させることは可能です。以下のような構成にすれば実現できます。
+
+⸻
+
+✅ 目的
+	•	MapLibre 上で表示している地図のスタイルを、Maputnik 上で編集し、保存なしで即時反映させる
+	•	ユーザにファイル操作（ダウンロード／アップロード）をさせない
+
+⸻
+
+🔧 解決策：Maputnik を iframe 経由で Vue に埋め込み、スタイルの双方向通信を行う
+
+概要構成図：
+
+[ Vue + MapLibre 地図画面 ]
+        |
+        | iframe
+        ↓
+[ Maputnik (self-hosted) ]
+        ↑
+        | postMessage で style JSON を Vue に送信
+
+
+⸻
+
+🪄 手順
+
+① Maputnik をオンプレ or ローカルでホストする（例：Docker）
+
+docker run --rm -it -p 8888:8888 maputnik/editor
+
+Vue から http://localhost:8888 に iframe でアクセスする。
+
+⸻
+
+② Vue に iframe を埋め込み
+
+<template>
+  <div>
+    <MapLibreMap :style="mapStyle" />
+    <button @click="showEditor = !showEditor">スタイル編集</button>
+
+    <iframe
+      v-if="showEditor"
+      ref="maputnik"
+      :src="editorUrl"
+      style="width: 100%; height: 500px; border: none;"
+    />
+  </div>
+</template>
+
+
+⸻
+
+③ 初期スタイルを Maputnik に渡す（postMessage）
+
+onMounted(() => {
+  window.addEventListener("message", receiveMessage);
+
+  // iframe に初期 style を送信
+  const iframe = refs.maputnik as HTMLIFrameElement;
+  iframe.onload = () => {
+    iframe.contentWindow?.postMessage({
+      action: "setStyle",
+      payload: initialStyleJson
+    }, "*");
+  };
+});
+
+
+⸻
+
+④ Maputnik 側の index.html をカスタマイズ（スタイル変更時に postMessage で Vue に返す）
+
+Maputnik はオープンソースなので、以下のように一部 JavaScript を追加できます：
+
+// 編集中に style 更新されたときに親ウィンドウへ送信
+editor.store.subscribe(() => {
+  const style = editor.store.getState().style;
+  window.parent.postMessage({
+    action: "styleUpdated",
+    payload: style
+  }, "*");
+});
+
+
+⸻
+
+⑤ Vue 側でスタイルを受け取り、MapLibre に即時反映
+
+function receiveMessage(event: MessageEvent) {
+  if (event.data.action === "styleUpdated") {
+    mapStyle.value = event.data.payload; // 再描画
+  }
+}
+
+
+⸻
+
+🔒 セキュリティ上の注意
+	•	postMessage には信頼できる origin をチェックする（event.origin）。
+	•	Maputnik を埋め込む際には CORS 設定に注意。
+
+⸻
+
+✅ メリット
+	•	ファイルのダウンロード／アップロード一切不要
+	•	編集内容が即反映され、ユーザ体験が大きく向上
+	•	完全オンプレで実現可能
+
+⸻
+
+✋補足：より高度にするなら…
+	•	スタイルのバージョン管理（編集内容を DB に保存など）
+	•	編集用ユーザー制限（Maputnik を Vue のログイン情報と連携）
+
+⸻
+
+必要であれば、Maputnik 側のコード修正部分や、Vue 側の MapLibre リフレッシュ処理の具体例も提供します。希望があればお知らせください。
