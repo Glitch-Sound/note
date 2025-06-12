@@ -1,0 +1,333 @@
+以下に、FastFlow + DINO-ViT 構成の良品検査用コードを Docker環境で動作可能にするための構成一式 を提示します。
+
+⸻
+
+📁 ディレクトリ構成（再掲 + Docker対応）
+
+fastflow_dino/
+├── configs/
+│   └── config.yaml
+├── data/                           ← ホストからbind mount（学習/推論用画像格納）
+│   ├── train/
+│   └── test/
+├── models/
+│   ├── dino_feature.py
+│   └── fastflow.py
+├── train.py
+├── infer.py
+├── utils.py                        ← オプション
+├── requirements.txt               ← 必要ライブラリ
+├── Dockerfile                     ← Dockerビルド定義
+├── docker-compose.yml             ← docker-compose構成
+└── entrypoint.sh                  ← 実行時スクリプト
+
+
+⸻
+
+📄 requirements.txt
+
+torch>=2.0
+torchvision>=0.15
+timm
+numpy
+opencv-python
+scikit-learn
+matplotlib
+pyyaml
+
+
+⸻
+
+🐳 Dockerfile
+
+FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
+
+# 作業ディレクトリ設定
+WORKDIR /app
+
+# Pythonパッケージのインストール
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# スクリプトのコピー
+COPY . .
+
+# 実行用エントリポイントスクリプト
+RUN chmod +x entrypoint.sh
+ENTRYPOINT ["./entrypoint.sh"]
+
+
+⸻
+
+📜 docker-compose.yml
+
+version: "3"
+services:
+  fastflow:
+    build: .
+    volumes:
+      - ./data:/app/data                # 学習/推論データ
+      - ./configs:/app/configs
+    environment:
+      - PYTHONUNBUFFERED=1
+    runtime: nvidia                     # NVIDIA GPU 使用
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    command: ["bash"]
+
+⚠️ NVIDIA GPU 環境では --gpus all に対応するため、nvidia-container-toolkit が必要です。
+
+⸻
+
+⚙️ entrypoint.sh
+
+#!/bin/bash
+
+echo "==== FastFlow + DINO ===="
+echo "1: 学習モード"
+echo "2: 推論モード"
+read -p "モードを選んでください (1 or 2): " mode
+
+if [ "$mode" = "1" ]; then
+    python train.py
+elif [ "$mode" = "2" ]; then
+    python infer.py
+else
+    echo "無効な選択です"
+fi
+
+
+⸻
+
+✅ 起動手順（GPUマシン前提）
+
+# ビルド
+docker compose build
+
+# 実行（GPU対応）
+docker compose run --rm --gpus all fastflow
+
+実行後、モードを聞かれるので「1」（学習）または「2」（推論）を選択してください。
+
+⸻
+
+🔚 オプション：CPU動作用の変更
+
+Dockerfileのベースイメージを以下に変えることで、CPUでも動作可能です：
+
+FROM pytorch/pytorch:2.0.1-cpu
+
+また、docker-compose.yml から runtime: nvidia を削除してください。
+
+⸻
+
+📦 補足
+	•	モデルの保存先は fastflow.pth（ローカル /app に保存されます）
+	•	データセットは ./data/train/normal/ および ./data/test/anomaly/ で管理
+	•	コンテナ上で作業するなら docker compose run fastflow bash で手動操作可能
+
+⸻
+
+了解しました。以下に、FastFlow + DINO-ViT を用いた良品検査のための PyTorch 学習・推論コード、ファイル構成、データ指定方法をすべて整えてご紹介します。
+
+⸻
+
+✅ 想定構成（概要）
+	•	特徴抽出器：DINO-ViT（事前学習済）
+	•	異常検知部：FastFlow（2D Normalizing Flow）
+	•	対象：良品画像のみを学習し、異常検出
+
+⸻
+
+📂 ディレクトリ構成
+
+fastflow_dino/
+├── configs/
+│   └── config.yaml              ← 各種パラメータ設定
+├── data/
+│   ├── train/                   ← 良品画像だけを格納
+│   │   ├── img1.jpg
+│   │   └── ...
+│   └── test/
+│       ├── good/               ← テスト時の良品（Optional）
+│       └── anomaly/            ← テスト時の異常品
+├── models/
+│   ├── dino_feature.py         ← 特徴抽出器（DINO-ViT）
+│   └── fastflow.py             ← FastFlow本体
+├── train.py                    ← 学習スクリプト
+├── infer.py                    ← 推論スクリプト
+└── utils.py                    ← 補助関数（画像読み込みなど）
+
+
+⸻
+
+📦 必要ライブラリ
+
+pip install torch torchvision timm numpy opencv-python scikit-learn matplotlib
+
+
+⸻
+
+🧠 特徴抽出器（models/dino_feature.py）
+
+import torch
+import timm
+
+class DINOFeatureExtractor(torch.nn.Module):
+    def __init__(self, model_name='vit_base_patch16_224_dino'):
+        super().__init__()
+        self.model = timm.create_model(model_name, pretrained=True, num_classes=0)
+    
+    def forward(self, x):
+        feats = self.model.forward_features(x)  # (B, tokens, C)
+        return feats.mean(dim=1)  # Global average
+
+
+⸻
+
+🔁 FastFlow本体（models/fastflow.py）※簡易例
+
+import torch
+import torch.nn as nn
+
+class FastFlow(nn.Module):
+    def __init__(self, feature_dim, flow_steps=8):
+        super().__init__()
+        self.flows = nn.Sequential(*[self._make_flow_step(feature_dim) for _ in range(flow_steps)])
+    
+    def _make_flow_step(self, dim):
+        return nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+
+    def forward(self, features):
+        z = features
+        for flow in self.flows:
+            z = flow(z)
+        return z
+
+
+⸻
+
+⚙️ 設定ファイル（configs/config.yaml）
+
+feature_extractor: vit_base_patch16_224_dino
+train_dir: data/train/
+test_dir: data/test/anomaly/
+batch_size: 16
+epochs: 10
+lr: 1e-4
+device: cuda
+
+
+⸻
+
+📚 学習スクリプト（train.py）
+
+import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms, datasets
+from models.dino_feature import DINOFeatureExtractor
+from models.fastflow import FastFlow
+import yaml
+import os
+
+with open("configs/config.yaml") as f:
+    cfg = yaml.safe_load(f)
+
+device = torch.device(cfg["device"])
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+train_data = datasets.ImageFolder(cfg["train_dir"], transform=transform)
+train_loader = DataLoader(train_data, batch_size=cfg["batch_size"], shuffle=True)
+
+feature_net = DINOFeatureExtractor(cfg["feature_extractor"]).to(device)
+flow_net = FastFlow(feature_dim=768).to(device)
+
+optimizer = torch.optim.Adam(flow_net.parameters(), lr=cfg["lr"])
+
+feature_net.eval()
+for epoch in range(cfg["epochs"]):
+    flow_net.train()
+    for imgs, _ in train_loader:
+        imgs = imgs.to(device)
+        with torch.no_grad():
+            feats = feature_net(imgs)
+        z = flow_net(feats)
+        loss = z.norm(p=2, dim=1).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    print(f"Epoch {epoch+1}: loss = {loss.item():.4f}")
+
+torch.save(flow_net.state_dict(), "fastflow.pth")
+
+
+⸻
+
+🔎 推論スクリプト（infer.py）
+
+import torch
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader
+from models.dino_feature import DINOFeatureExtractor
+from models.fastflow import FastFlow
+import yaml
+
+with open("configs/config.yaml") as f:
+    cfg = yaml.safe_load(f)
+
+device = torch.device(cfg["device"])
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+test_data = datasets.ImageFolder(cfg["test_dir"], transform=transform)
+test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
+
+feature_net = DINOFeatureExtractor(cfg["feature_extractor"]).to(device)
+flow_net = FastFlow(feature_dim=768).to(device)
+flow_net.load_state_dict(torch.load("fastflow.pth"))
+feature_net.eval()
+flow_net.eval()
+
+for imgs, labels in test_loader:
+    imgs = imgs.to(device)
+    with torch.no_grad():
+        feats = feature_net(imgs)
+        z = flow_net(feats)
+        score = z.norm(p=2, dim=1).item()
+    print(f"Score: {score:.2f} | Label: {labels.item()}")
+
+
+⸻
+
+📁 画像配置方法（概要）
+	•	data/train/normal/ に良品画像だけを置く（学習時）
+	•	data/test/anomaly/ に異常画像を置く（推論対象）
+
+⸻
+
+✅ 補足ポイント
+	•	score は異常スコアなので、大きいほど異常の可能性が高い
+	•	閾値は、良品画像のスコア分布から経験的に決定（例：良品最大スコア × 1.2）
+
+⸻
+
+
+
+
+
+
+
