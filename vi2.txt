@@ -1,0 +1,258 @@
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from tqdm import tqdm
+import random
+from PIL import Image
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+IMG_SIZE = 340
+C = 384
+BATCH_SIZE = 8
+EPOCHS = 50
+
+TRAIN_DIR = "./data/train"
+TEST_DIR = "./data/test"
+RESULT_DIR = "./result"
+MODEL_PATH = os.path.join(RESULT_DIR, "flow.pth")
+MEANZ_PATH = os.path.join(RESULT_DIR, "mean_z.npy")
+INVCOV_PATH = os.path.join(RESULT_DIR, "inv_cov.npy")
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    random.seed(seed)
+    if DEVICE == "cuda":
+        torch.cuda.manual_seed_all(seed)
+set_seed(42)
+
+class DINOExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = torch.hub.load('facebookresearch/dino:main', 'dino_vits16')
+        self.model.eval().to(DEVICE)
+    def forward(self, x):
+        return self.model.get_intermediate_layers(x, n=1)[0][0]
+
+def preprocess(img_path):
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    img = Image.fromarray(img)
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    return transform(img).unsqueeze(0)
+
+class Invertible1x1Conv(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        w_init = np.linalg.qr(np.random.randn(num_features, num_features))[0].astype(np.float32)
+        self.weight = nn.Parameter(torch.from_numpy(w_init))
+    def forward(self, x, reverse=False):
+        B, D = x.size()
+        weight = self.weight
+        if not reverse:
+            log_det = torch.slogdet(weight)[1] * B
+            x = x @ weight
+            return x, log_det
+        else:
+            inv_weight = torch.inverse(weight.double()).float()
+            log_det = -torch.slogdet(weight)[1] * B
+            x = x @ inv_weight
+            return x, log_det
+
+class AffineCoupling(nn.Module):
+    def __init__(self, in_dim, hidden_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim//2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, in_dim)
+        )
+    def forward(self, x, reverse=False):
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        h = self.net(x1)
+        shift, scale = torch.chunk(h, 2, dim=-1)
+        scale = torch.tanh(scale)
+        if not reverse:
+            y2 = (x2 + shift) * torch.exp(scale)
+            log_det = scale.sum(dim=-1)
+            y = torch.cat([x1, y2], dim=-1)
+            return y, log_det
+        else:
+            y2 = x2
+            x2 = y2 * torch.exp(-scale) - shift
+            y = torch.cat([x1, x2], dim=-1)
+            log_det = -scale.sum(dim=-1)
+            return y, log_det
+
+class FlowStep(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.conv = Invertible1x1Conv(num_features)
+        self.coupling = AffineCoupling(num_features)
+    def forward(self, x, reverse=False):
+        if not reverse:
+            x, log_det1 = self.conv(x, reverse=False)
+            x, log_det2 = self.coupling(x, reverse=False)
+            return x, log_det1 + log_det2
+        else:
+            x, log_det2 = self.coupling(x, reverse=True)
+            x, log_det1 = self.conv(x, reverse=True)
+            return x, log_det1 + log_det2
+
+class FastFlow(nn.Module):
+    def __init__(self, in_dim, flow_depth=8):
+        super().__init__()
+        self.steps = nn.ModuleList([FlowStep(in_dim) for _ in range(flow_depth)])
+    def forward(self, x, reverse=False):
+        sum_logdet = 0.0
+        if not reverse:
+            for step in self.steps:
+                x, logdet = step(x, reverse=False)
+                sum_logdet = sum_logdet + logdet
+        else:
+            for step in reversed(self.steps):
+                x, logdet = step(x, reverse=True)
+                sum_logdet = sum_logdet + logdet
+        return x, sum_logdet
+
+def extract_features(extractor, paths):
+    feats = []
+    for img_path in tqdm(paths, desc="Extract features"):
+        img = preprocess(img_path).to(DEVICE)
+        with torch.no_grad():
+            f = extractor(img)
+        if f.dim() == 2:
+            f = f.unsqueeze(0)
+        f = f[:, 1:, :]
+        feats.append(f.cpu())
+    feats = torch.cat(feats, dim=0)
+    return feats
+
+def standardize_feats(feats):
+    mean = feats.mean(dim=0, keepdim=True)
+    std = feats.std(dim=0, keepdim=True) + 1e-6
+    feats = (feats - mean) / std
+    print(f"Standardize: mean shape {mean.shape}, std shape {std.shape}")
+    print(f"Standardize: mean mean={mean.mean():.5f}, std mean={std.mean():.5f}")
+    return feats, mean, std
+
+def train_flow(flow, feats):
+    flow.train()
+    optimizer = torch.optim.Adam(flow.parameters(), lr=1e-4)
+    N, T, C_ = feats.shape
+    print('Start FastFlow training')
+    for epoch in range(EPOCHS):
+        perm = torch.randperm(N)
+        loss_list = []
+        for i in range(0, N, BATCH_SIZE):
+            batch = feats[perm[i:i+BATCH_SIZE]].to(DEVICE)
+            B = batch.shape[0]
+            batch = batch.reshape(B*T, C_)
+            z, logdet = flow(batch)
+            log_prob = -0.5 * (z ** 2 + np.log(2 * np.pi)).sum(-1)
+            loss = (-(log_prob + logdet).mean()) / (B * T)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            loss_list.append(loss.item())
+        print(f"Epoch {epoch+1:3d}: Loss={np.mean(loss_list):.6f} per patch")
+    torch.save(flow.state_dict(), MODEL_PATH)
+
+def save_z_stats(flow, train_feats):
+    flow.eval()
+    N, T, C_ = train_feats.shape
+    train_feats = train_feats.reshape(N*T, C_)
+    zs = []
+    with torch.no_grad():
+        for i in range(0, len(train_feats), BATCH_SIZE):
+            batch = train_feats[i:i+BATCH_SIZE].to(DEVICE)
+            z, _ = flow(batch)
+            zs.append(z.cpu())
+    zs = torch.cat(zs, dim=0).numpy()
+    mean_z = zs.mean(axis=0)
+    cov = np.cov(zs.T)
+    inv_cov = np.linalg.pinv(cov + 1e-6 * np.eye(C_))
+    np.save(MEANZ_PATH, mean_z)
+    np.save(INVCOV_PATH, inv_cov)
+    print('Saved z-space mean/inv_cov to disk.')
+    print(f"mean_z shape: {mean_z.shape}, mean_z mean={mean_z.mean():.5f}, std={mean_z.std():.5f}")
+    print(f"inv_cov shape: {inv_cov.shape}, inv_cov mean={inv_cov.mean():.5f}, std={inv_cov.std():.5f}")
+
+def infer_and_save_heatmaps(extractor, flow, mean, std, mean_z, inv_cov, test_paths):
+    extractor.eval()
+    flow.eval()
+    patch_side = int(np.sqrt((IMG_SIZE // 16) ** 2))
+    for idx, img_path in enumerate(tqdm(test_paths, desc="Inference")):
+        img = preprocess(img_path).to(DEVICE)
+        with torch.no_grad():
+            f = extractor(img)
+            if f.dim() == 2:
+                f = f.unsqueeze(0)
+            f = f[:, 1:, :]
+            print(f"\n=== {os.path.basename(img_path)} ===")
+            print(f"Feature (before std): min={f.min():.4f}, max={f.max():.4f}, mean={f.mean():.4f}")
+            f = (f - mean.to(DEVICE)) / std.to(DEVICE)
+            print(f"Feature (after std): min={f.min():.4f}, max={f.max():.4f}, mean={f.mean():.4f}")
+            f = f.reshape(-1, C)
+            z, _ = flow(f)
+        z_np = z.cpu().numpy()
+        print(f"z: min={z_np.min():.4f}, max={z_np.max():.4f}, mean={z_np.mean():.4f}, shape={z_np.shape}")
+        diff = z_np - mean_z
+        dists = np.einsum('ij,jk,ik->i', diff, inv_cov, diff)
+        print(f"dists: min={dists.min():.4f}, max={dists.max():.4f}, mean={dists.mean():.4f}, shape={dists.shape}")
+        n_patch = len(dists)
+        patch_side = int(np.sqrt(n_patch))
+        anomaly_map = dists.reshape(patch_side, patch_side)
+        print(f"anomaly_map: min={anomaly_map.min():.4f}, max={anomaly_map.max():.4f}, mean={anomaly_map.mean():.4f}")
+        anomaly_map_resized = cv2.resize(anomaly_map, (IMG_SIZE, IMG_SIZE))
+        anomaly_map_resized = (anomaly_map_resized - anomaly_map_resized.min()) / (anomaly_map_resized.ptp() + 1e-6)
+        raw = cv2.imread(img_path)
+        raw = cv2.resize(raw, (IMG_SIZE, IMG_SIZE))
+        heatmap = cv2.applyColorMap(np.uint8(255 * anomaly_map_resized), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(raw, 0.6, heatmap, 0.4, 0)
+        save_path = os.path.join(RESULT_DIR, os.path.basename(img_path))
+        cv2.imwrite(save_path, overlay)
+        if idx == 0:
+            # 最初の画像だけ、特徴量やz値、異常スコア配列を保存しておくと便利
+            np.save(os.path.join(RESULT_DIR, f"{os.path.basename(img_path)}_debug_f.npy"), f.cpu().numpy())
+            np.save(os.path.join(RESULT_DIR, f"{os.path.basename(img_path)}_debug_z.npy"), z_np)
+            np.save(os.path.join(RESULT_DIR, f"{os.path.basename(img_path)}_debug_anomaly_map.npy"), anomaly_map)
+
+def main():
+    extractor = DINOExtractor()
+    flow = FastFlow(C, flow_depth=8).to(DEVICE)
+    train_paths = [os.path.join(TRAIN_DIR, f) for f in os.listdir(TRAIN_DIR) if f.lower().endswith(('png','jpg','jpeg'))]
+    test_paths = [os.path.join(TEST_DIR, f) for f in os.listdir(TEST_DIR) if f.lower().endswith(('png','jpg','jpeg'))]
+
+    train_feats = extract_features(extractor, train_paths)
+    train_feats, mean, std = standardize_feats(train_feats)
+
+    if os.path.exists(MODEL_PATH) and os.path.exists(MEANZ_PATH) and os.path.exists(INVCOV_PATH):
+        flow.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        print("Loaded pre-trained FastFlow model and z-space stats.")
+    else:
+        train_flow(flow, train_feats)
+        save_z_stats(flow, train_feats)
+
+    mean_z = np.load(MEANZ_PATH)
+    inv_cov = np.load(INVCOV_PATH)
+
+    print(f"mean shape: {mean.shape}, std shape: {std.shape}")
+    print(f"mean mean={mean.mean():.5f}, std mean={std.mean():.5f}")
+    print(f"mean_z shape: {mean_z.shape}, inv_cov shape: {inv_cov.shape}")
+    print(f"mean_z mean={mean_z.mean():.5f}, inv_cov mean={inv_cov.mean():.5f}")
+
+    infer_and_save_heatmaps(extractor, flow, mean, std, mean_z, inv_cov, test_paths)
+
+if __name__ == '__main__':
+    main()
