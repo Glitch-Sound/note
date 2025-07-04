@@ -1,0 +1,15 @@
+from df.enhance import enhance, init_df, save_audio
+import soundfile as sf
+
+input_wav = "input.wav"
+output_wav = "output_denoised.wav"
+
+# モデル初期化
+model, df_state, args = init_df()
+# 音声読み込み
+audio, sr = sf.read(input_wav)
+# ノイズ除去
+audio_denoised = enhance(model, df_state, audio, args)
+# 保存
+save_audio(output_wav, audio_denoised, sr)
+print("環境音除去 完了:", output_wav)
