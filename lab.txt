@@ -1,0 +1,168 @@
+はい、WSL2上で**GitLab（Community Edition）**を構築することは可能です！
+ただし、「GitLabは重めなサービス（CPU/RAMもやや多めに消費）」なので、PCのスペックによっては動作が遅く感じることがあります。
+以下、一番手軽な「DockerによるGitLab構築」手順を紹介します。
+
+⸻
+
+【手順】WSL2上にDocker版GitLabを構築する
+
+1. WSL2でDockerを使えるようにしておく
+	•	すでに docker コマンドがWSL2内で動くこと（docker --versionで確認）
+	•	Docker DesktopでもOK（裏でWSL2と連携可）
+
+⸻
+
+2. 作業用ディレクトリを作る
+
+mkdir -p ~/gitlab-data/config ~/gitlab-data/logs ~/gitlab-data/data
+cd ~/gitlab-data
+
+
+⸻
+
+3. docker-compose.yml を用意
+
+下記を ~/gitlab-data/docker-compose.yml に保存します。
+
+version: '3'
+services:
+  gitlab:
+    image: 'gitlab/gitlab-ce:latest'
+    restart: always
+    hostname: 'localhost'
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost'
+    ports:
+      - '80:80'
+      - '443:443'
+      - '22:22'
+    volumes:
+      - './config:/etc/gitlab'
+      - './logs:/var/log/gitlab'
+      - './data:/var/opt/gitlab'
+
+
+⸻
+
+4. GitLabコンテナを起動
+
+docker compose up -d
+
+docker-compose up -d でも可（バージョンによる）
+
+⸻
+
+5. ブラウザでアクセス
+	•	http://localhost
+（初回は数分かかります。しばらくしてからアクセス）
+
+⸻
+
+6. 初期パスワードの確認
+	•	下記コマンドで初期rootパスワードを取得します
+
+sudo cat ~/gitlab-data/config/initial_root_password
+
+
+	•	または、コンテナログからも確認できます
+
+docker logs $(docker ps -qf "ancestor=gitlab/gitlab-ce")
+
+
+
+⸻
+
+7. ログイン
+	•	ユーザー名：root
+	•	パスワード：上記で確認した初期パスワード
+
+⸻
+
+【Tips・注意】
+	•	WSL2のIPとWindowsのlocalhostは場合によっては別物です。
+普通はhttp://localhostでOKですが、もしつながらない場合はip addrでWSL2のIPを調べてWindowsからhttp://<そのIP>でアクセスするとうまくいく場合もあります。
+	•	ポート競合に注意（80, 443, 22が使われていると起動エラー）
+
+⸻
+
+もし
+	•	メモリが足りない/遅い場合：docker-compose.ymlでリソースを制限・調整できます
+	•	外部からアクセスしたい場合、WindowsのファイアウォールやWSL2のネットワーク設定が必要です
+	•	SSLを有効にしたい場合、external_urlを https://〜 に変更 & 証明書準備が必要です
+
+⸻
+
+必要なら
+	•	バックアップ/移行方法
+	•	メール連携/LDAPなど外部認証
+	•	ユーザ追加、プロジェクト初期化の自動化
+
+なども案内できます！
+
+⸻
+
+他にも
+	•	GitLab Runner（CI/CD）もWSL2＋Dockerで簡単に立てられます
+	•	オンプレ用途の場合はバックアップや永続化も忘れずに！
+
+⸻
+
+もし「トラブルが出た」「さらに細かいカスタムがしたい」など、何か詰まったらその内容教えてください。
+最小構成サンプルが欲しい場合もリクエストOKです！
+
+
+
+OKです！
+GitLabのアクセス用ポート番号（例：HTTPの80→8081にしたい等）は、docker-compose.ymlのports設定を変更するだけでOKです。
+
+⸻
+
+例：アクセス用ポートを変える
+
+たとえば、
+	•	HTTP → 8081
+	•	HTTPS → 4443
+	•	SSH → 2222
+でアクセスしたい場合は、
+docker-compose.yml の ports 部分を下記のようにします。
+
+services:
+  gitlab:
+    image: 'gitlab/gitlab-ce:latest'
+    restart: always
+    hostname: 'localhost'
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost:8081'
+    ports:
+      - '8081:80'     # ← ローカル8081 → コンテナ80 (http)
+      - '4443:443'    # ← ローカル4443 → コンテナ443 (https)
+      - '2222:22'     # ← ローカル2222 → コンテナ22 (ssh)
+    volumes:
+      - './config:/etc/gitlab'
+      - './logs:/var/log/gitlab'
+      - './data:/var/opt/gitlab'
+
+
+⸻
+
+	•	この設定だと
+	•	ブラウザからは http://localhost:8081
+	•	HTTPSは https://localhost:4443
+	•	SSHは ssh -p 2222 ...
+でアクセスできます。
+
+⸻
+
+注意点
+	•	external_url も http://localhost:8081 のように必ずポート番号を付ける
+	•	docker compose up -dで再起動（設定変更後は必ず再起動！）
+
+⸻
+
+もし、他のポート番号や複数環境などで困った場合も、具体的な構成や要件を書いてくれたら、ピンポイントでアドバイスします！
+
+⸻
+
+他にも疑問があれば何でもどうぞ！
