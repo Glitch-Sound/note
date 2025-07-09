@@ -110,3 +110,148 @@ pip install opencv-python
 
 ご希望の形や環境詳細（例：USBカメラ直結利用必須 or IPカメラ化可能か）などあれば教えてください。
 どちらのルートでも細かく手順を案内できます！
+
+
+
+はい、Windowsに接続した2台のカメラ映像をPythonに送り、Python側で合成することは可能です。
+
+実現方法は大きく分けて2つあります。
+
+⸻
+
+1. Windowsで直接Pythonを使う場合（最も簡単・確実）
+
+A. Python（OpenCV）で2台のカメラを同時に取得し合成する方法
+
+import cv2
+import numpy as np
+
+# 0番目と1番目のカメラをオープン
+cap1 = cv2.VideoCapture(0)
+cap2 = cv2.VideoCapture(1)
+
+if not cap1.isOpened() or not cap2.isOpened():
+    print("カメラが認識できません")
+    exit()
+
+while True:
+    ret1, frame1 = cap1.read()
+    ret2, frame2 = cap2.read()
+    if not ret1 or not ret2:
+        break
+
+    # サイズ揃える（必要に応じてリサイズ）
+    h, w = frame1.shape[:2]
+    frame2 = cv2.resize(frame2, (w, h))
+
+    # 横方向に合成（左右連結）例
+    combined = np.hstack((frame1, frame2))
+
+    cv2.imshow('Combined Camera', combined)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap1.release()
+cap2.release()
+cv2.destroyAllWindows()
+
+この方法のポイント：
+	•	Windows上のPythonスクリプトで2台のUSBカメラから同時に映像を取得し、numpy.hstack などで合成
+	•	映像の保存や配信も同時にできます（cv2.VideoWriterで録画、FlaskなどでHTTP配信）
+
+⸻
+
+2. Windows → WSL/Docker で分けて運用したい場合
+
+A. Windowsでカメラ映像を配信（Webサーバ or 仮想カメラ）して、WSLから受け取る
+
+ステップ
+	1.	Windowsで各カメラごとにPython HTTP配信サーバを立てる（前述Flaskサンプルを2つポートを変えて起動）
+	2.	WSL/Docker側でそれぞれのURLからストリーム取得、合成処理を行う
+
+Windows側カメラ配信サンプル（2台分）
+
+例：
+	•	win_camera_stream_0.py（カメラ0→8080ポートで配信）
+	•	win_camera_stream_1.py（カメラ1→8081ポートで配信）
+
+カメラ番号だけ変更して、それぞれのPythonサーバを同時に起動。
+
+# win_camera_stream_0.py
+import cv2
+from flask import Flask, Response
+
+app = Flask(__name__)
+
+def gen():
+    cap = cv2.VideoCapture(0)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        _, jpeg = cv2.imencode('.jpg', frame)
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+
+@app.route('/video')
+def video_feed():
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, threaded=True)
+
+※カメラ1用は cv2.VideoCapture(1) とポート番号を変えて同様に。
+
+WSL側での合成サンプル
+
+import cv2
+import numpy as np
+
+URL1 = 'http://<windows_ip>:8080/video'
+URL2 = 'http://<windows_ip>:8081/video'
+
+cap1 = cv2.VideoCapture(URL1)
+cap2 = cv2.VideoCapture(URL2)
+
+while True:
+    ret1, frame1 = cap1.read()
+    ret2, frame2 = cap2.read()
+    if not ret1 or not ret2:
+        continue
+    # 必要に応じてリサイズ
+    h, w = frame1.shape[:2]
+    frame2 = cv2.resize(frame2, (w, h))
+    combined = np.hstack((frame1, frame2))
+    cv2.imshow('Combined', combined)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+cap1.release()
+cap2.release()
+cv2.destroyAllWindows()
+
+
+⸻
+
+3. OBS利用パターンも可能
+	•	OBSで2台のカメラを取り込み「仮想カメラ」として配信
+	•	Pythonから仮想カメラを cv2.VideoCapture で受け取ることもできる（ただし合成はOBS内で）
+
+⸻
+
+4. 注意点
+	•	Windowsで2台のUSBカメラを同時利用できるかは、カメラ機種やUSB帯域で制限あり（稀に片方しか認識しない場合もある）
+	•	WSL2やDockerだけでUSBカメラを直接操作するのは困難（基本的にWindowsでキャプチャし、ネットワーク越しに映像転送が現実的）
+
+⸻
+
+まとめ
+	•	一番確実・シンプルなのは「Windows上でPythonで2台のカメラ取得→合成」
+	•	WSLやDockerで合成したい場合は「WindowsでHTTP配信→WSLで取得・合成」も可能
+	•	OBSも使えるが、OBS内合成→仮想カメラ出力になる
+
+⸻
+
+必要な方式・用途（録画、リアルタイム処理、ネット配信…など）によって最適案を具体化できます。
+
+どの方法でやりたいか、もう少し希望を教えてもらえれば、コードや設定まで詰めてご案内します！
+
+
