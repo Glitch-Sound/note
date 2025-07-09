@@ -1,0 +1,124 @@
+はい、Vue 3 + Vuetify 3 のフロントエンドのみ、
+最小限・軽量のDocker構成（バックエンド無し、ホットリロード対応、最短起動）を出します。
+
+⸻
+
+1. ディレクトリ構成例
+
+your-project/
+├── Dockerfile
+├── docker-compose.yml
+├── package.json
+├── vite.config.js
+├── src/
+│   └── main.js
+│   └── App.vue
+└── ...（Vueプロジェクトの各種ファイル）
+
+
+⸻
+
+2. Dockerfile
+
+# node:20-slim など最新版・軽量を利用
+FROM node:20-slim
+
+# 作業ディレクトリ
+WORKDIR /app
+
+# 依存ファイルをコピー
+COPY package*.json ./
+
+# 依存インストール
+RUN npm install
+
+# ソース一式をコピー
+COPY . .
+
+# 5173番でVite開発サーバ起動
+EXPOSE 5173
+
+CMD ["npm", "run", "dev", "--", "--host"]
+
+
+⸻
+
+3. docker-compose.yml
+
+version: "3.8"
+services:
+  front:
+    build: .
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./:/app
+      - /app/node_modules # ホストのnode_modulesを隠すため
+    environment:
+      - NODE_ENV=development
+    tty: true
+
+
+⸻
+
+4. package.json（主要部のみ抜粋例）
+
+{
+  "name": "vuetify-vue-app",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "vue": "^3.4.0",
+    "vuetify": "^3.6.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}
+
+※ npm create vite@latest で生成し、vuetifyを追加すればOKです。
+
+⸻
+
+5. Vite・Vuetify初期化の例
+
+src/main.js:
+
+import { createApp } from 'vue'
+import App from './App.vue'
+import 'vuetify/styles'
+import { createVuetify } from 'vuetify'
+import * as components from 'vuetify/components'
+import * as directives from 'vuetify/directives'
+
+const vuetify = createVuetify({
+  components,
+  directives,
+})
+
+createApp(App).use(vuetify).mount('#app')
+
+
+⸻
+
+6. 使い方
+	1.	このディレクトリで
+
+docker-compose up --build
+
+
+	2.	ブラウザで http://localhost:5173
+→ ホットリロード対応、バックエンド無し、即確認可能
+
+⸻
+
+必要最小限でVue + Vuetifyの開発・検証ができます
+
+（API連携したい場合は後からでも追加できます）
+
+⸻
+
+もし「最初からプロジェクト雛形で欲しい」「コマンド例も知りたい」等あれば、さらに補足できます。
