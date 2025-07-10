@@ -299,3 +299,113 @@ cap.release()
 out.release()
 print(f"録画完了: {output_file}")
 
+
+
+---
+
+
+import cv2
+import os
+import time
+import subprocess
+
+def print_section(title):
+    print("\n" + "="*30)
+    print(title)
+    print("="*30)
+
+def show_video_devices():
+    print_section("デバイス一覧 (/dev/video*)")
+    os.system("ls -l /dev/video* 2>/dev/null")
+
+    print_section("v4l2-ctl --list-devices")
+    try:
+        subprocess.run(["v4l2-ctl", "--list-devices"], check=False)
+    except Exception as e:
+        print("v4l2-ctlが実行できません:", e)
+
+def show_user_info():
+    print_section("ユーザ・グループ情報")
+    os.system("id")
+
+def try_capture(dev):
+    print_section(f"{dev} カメラテスト")
+    cap = cv2.VideoCapture(dev)
+    if not cap.isOpened():
+        print(f"{dev}: cap.isOpened() = False（カメラが開けません）")
+        return False, None, None, None
+
+    # 基本情報取得
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps < 1:
+        fps = 30  # デフォルト
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"{dev}: 幅={width}, 高さ={height}, FPS={fps}")
+
+    # 解像度を明示セット
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    # 1フレームだけ読んでみる
+    ret, frame = cap.read()
+    print(f"{dev}: 1フレーム取得結果: {ret}, shape: {frame.shape if ret else None}")
+
+    cap.release()
+    return ret, fps, (width, height), frame
+
+def record_video(dev, output_file, duration_sec=5):
+    print_section(f"{dev} から録画開始")
+    cap = cv2.VideoCapture(dev)
+    if not cap.isOpened():
+        print(f"{dev}: cap.isOpened() = False（録画できません）")
+        return False
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps < 1:
+        fps = 30
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    size = (width, height)
+    print(f"録画: 幅={width}, 高さ={height}, FPS={fps}")
+
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(output_file, fourcc, fps, size)
+
+    start = time.time()
+    frames = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("フレーム取得失敗（録画中）")
+            break
+        out.write(frame)
+        frames += 1
+        if time.time() - start > duration_sec:
+            break
+
+    cap.release()
+    out.release()
+    print(f"録画完了: {output_file}, 総フレーム数: {frames}")
+    return True
+
+if __name__ == "__main__":
+    show_user_info()
+    show_video_devices()
+
+    dev = "/dev/video0"
+    ret, fps, size, frame = try_capture(dev)
+    if not ret:
+        print(f"ERROR: {dev} からフレーム取得できません。他のデバイスも試してください。")
+    else:
+        print(f"{dev} からフレーム取得に成功。録画を試みます。")
+        ok = record_video(dev, "output.avi", duration_sec=5)
+        if ok:
+            print("録画処理成功。output.avi を確認してください。")
+        else:
+            print("録画処理に失敗しました。")
+
+
+
+
+
