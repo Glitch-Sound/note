@@ -459,3 +459,5 @@ netsh advfirewall firewall add rule name="Allow RTSP 8554" dir=in action=allow p
 netsh advfirewall firewall add rule name="Allow RTSP 8554" dir=in action=allow protocol=TCP localport=8554
 
 
+ffmpeg -i rtsp://<WindowsIP>:8554/live -t 2 -f null -
+
