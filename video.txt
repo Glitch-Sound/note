@@ -255,3 +255,47 @@ cv2.destroyAllWindows()
 どの方法でやりたいか、もう少し希望を教えてもらえれば、コードや設定まで詰めてご案内します！
 
 
+----------
+
+import cv2
+import time
+
+device = "/dev/video0"
+output_file = "output.avi"
+duration = 5  # 秒
+
+cap = cv2.VideoCapture(device)
+
+# 失敗時
+if not cap.isOpened():
+    print("カメラが開けません")
+    exit(1)
+
+# カメラのフレームサイズ、FPSを取得
+fps = cap.get(cv2.CAP_PROP_FPS)
+if fps == 0:  # 機種依存で0になることがあるので、デフォルト30に
+    fps = 30
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+size = (width, height)
+
+print(f"録画サイズ: {size}, FPS: {fps}")
+
+# 出力用VideoWriter
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+out = cv2.VideoWriter(output_file, fourcc, fps, size)
+
+start = time.time()
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("フレーム取得失敗")
+        break
+    out.write(frame)
+    if time.time() - start > duration:
+        break
+
+cap.release()
+out.release()
+print(f"録画完了: {output_file}")
+
