@@ -1,0 +1,182 @@
+はい、uv（uv）でプロジェクトを管理しつつ、EfficientNet を使った画像分類の学習・推論の処理例・ファイル構成・uv addコマンド例をまとめます。
+
+⸻
+
+1. 最小限のファイル構成例
+
+your_project/
+├── main.py         # 実行スクリプト（学習・推論呼び出し）
+├── train.py        # 学習処理
+├── infer.py        # 推論処理
+├── dataset/        # データ格納用
+│   ├── train/
+│   └── val/
+├── models/         # 保存したモデル
+├── requirements.txt
+└── pyproject.toml  # (uvで管理)
+
+
+⸻
+
+2. uv add コマンド例（必要パッケージ導入）
+
+EfficientNetのPyTorch版を使う場合、torch, torchvision, efficientnet_pytorch などが必要です。
+
+uv add torch torchvision efficientnet_pytorch
+
+その他、データ拡張等も必要なら
+
+uv add numpy pillow
+
+
+⸻
+
+3. pyproject.toml/requirements.txt の書き方例
+
+uvは pyproject.toml を基本に動きますが、requirements.txt も自動生成されます。
+
+# pyproject.toml
+[project]
+name = "efficientnet-image-classify"
+dependencies = [
+    "torch",
+    "torchvision",
+    "efficientnet_pytorch",
+    "numpy",
+    "pillow"
+]
+
+
+⸻
+
+4. 学習・推論処理のサンプル（関数化）
+
+train.py
+
+from efficientnet_pytorch import EfficientNet
+import torch
+from torch import nn, optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+def train_efficientnet(
+    data_dir='dataset/train',
+    model_save_path='models/efficientnet.pth',
+    epochs=5,
+    batch_size=32,
+    lr=0.001
+):
+    # データ前処理
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+    dataset = datasets.ImageFolder(data_dir, transform=transform)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # EfficientNetB0 を利用
+    model = EfficientNet.from_pretrained('efficientnet-b0', num_classes=len(dataset.classes))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    for epoch in range(epochs):
+        model.train()
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+        print(f'Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}')
+    
+    torch.save(model.state_dict(), model_save_path)
+    print('モデル保存:', model_save_path)
+
+if __name__ == '__main__':
+    train_efficientnet()
+
+
+⸻
+
+infer.py
+
+from efficientnet_pytorch import EfficientNet
+from torchvision import transforms
+from PIL import Image
+import torch
+
+def infer_efficientnet(
+    image_path,
+    model_path='models/efficientnet.pth',
+    class_names=None
+):
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+    image = Image.open(image_path).convert('RGB')
+    image = transform(image).unsqueeze(0)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = EfficientNet.from_name('efficientnet-b0')
+    num_classes = len(class_names) if class_names else 2
+    model._fc = torch.nn.Linear(model._fc.in_features, num_classes)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+    with torch.no_grad():
+        output = model(image.to(device))
+        pred = output.argmax(1).item()
+    if class_names:
+        print(f"予測: {class_names[pred]}")
+    else:
+        print(f"予測クラス番号: {pred}")
+
+if __name__ == '__main__':
+    # 例: infer_efficientnet('dataset/val/cat/xxx.jpg', class_names=['cat', 'dog'])
+    pass
+
+
+⸻
+
+main.py（学習・推論の呼び出し）
+
+from train import train_efficientnet
+from infer import infer_efficientnet
+
+if __name__ == '__main__':
+    # 学習
+    train_efficientnet()
+    # 推論
+    # infer_efficientnet('dataset/val/cat/sample.jpg', class_names=['cat', 'dog'])
+
+
+⸻
+
+5. データセット配置例
+	•	dataset/train/クラス名1/画像.jpg
+	•	dataset/train/クラス名2/画像.jpg
+	•	dataset/val/クラス名1/画像.jpg
+	•	など、ImageFolder 形式（PyTorch標準）
+
+⸻
+
+6. uvワークフロー例
+
+uv venv         # 仮想環境作成
+uv pip install --upgrade pip  # pip更新（任意）
+uv add torch torchvision efficientnet_pytorch numpy pillow
+uv pip freeze   # requirements.txt にも反映
+python main.py  # 学習実行
+
+
+⸻
+
+まとめ
+	•	ファイル構成と必要パッケージ、uv addコマンド例、関数化した学習・推論処理を示しました。
+	•	実データで運用する際は、クラス名リスト・評価処理・コマンド引数化なども追加で実装するとよいです。
+
+もし「データセットをDLしたい」「CLIで引数指定したい」など要望あれば続けてどうぞ！
