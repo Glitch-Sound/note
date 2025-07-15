@@ -179,4 +179,108 @@ python main.py  # 学習実行
 	•	ファイル構成と必要パッケージ、uv addコマンド例、関数化した学習・推論処理を示しました。
 	•	実データで運用する際は、クラス名リスト・評価処理・コマンド引数化なども追加で実装するとよいです。
 
-もし「データセットをDLしたい」「CLIで引数指定したい」など要望あれば続けてどうぞ！
+もし「データセットをDLしたい」「CLIで引数指定したい」など
+要望あれば続けてどうぞ！
+
+
+
+---
+
+もちろん対応可能です！
+val配下の全画像を使って推論し、正解率（accuracy）を出力する方法を解説します。
+
+⸻
+
+1. シンプルな評価用スクリプト例
+
+infer.pyに追記するか、evaluate.pyなど新しいファイルで以下のように書くのがオススメです。
+
+from efficientnet_pytorch import EfficientNet
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import torch
+import os
+
+def evaluate_efficientnet(
+    data_dir='dataset/val',
+    model_path='models/efficientnet.pth',
+    batch_size=32
+):
+    # Data transform
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+    # ImageFolder形式でバリデーションデータを取得
+    dataset = datasets.ImageFolder(data_dir, transform=transform)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    # クラス名（ラベル順）
+    class_names = dataset.classes
+    num_classes = len(class_names)
+
+    # モデル構築・重みロード
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = EfficientNet.from_name('efficientnet-b0')
+    model._fc = torch.nn.Linear(model._fc.in_features, num_classes)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # 正解数カウント
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            preds = outputs.argmax(1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    accuracy = correct / total if total > 0 else 0
+    print(f'valデータ 正解率: {accuracy*100:.2f}% ({correct}/{total})')
+
+if __name__ == '__main__':
+    evaluate_efficientnet()
+
+
+⸻
+
+2. 使い方
+	1.	モデルを学習・保存しておく（models/efficientnet.pth）
+	2.	上記スクリプト（evaluate_efficientnet関数）を実行
+	3.	val配下の全画像で推論し、正解率が出力されます
+
+⸻
+
+3. 実行例
+
+python evaluate.py
+
+出力例:
+
+valデータ 正解率: 86.67% (26/30)
+
+
+⸻
+
+4. 注意点・補足
+	•	ImageFolder形式ならディレクトリ名=ラベルなので、val配下にクラス別ディレクトリが必要です。
+	•	クラス数は自動検出されます（dataset.classes）。
+	•	バッチサイズは調整可能です（大きいと速いが、メモリ注意）。
+	•	精度以外にも混同行列や分類ごとの精度も出せます。必要であれば続けてご質問ください。
+
+⸻
+
+5. まとめ
+	•	上記スクリプトで「val配下すべての画像の正解率」を簡単に評価できます。
+	•	他のメトリクス（リコール・F1など）や、予測ミス画像の保存もカスタマイズできます。
+
+⸻
+
+他にも「クラスごとの正解率」や「推論失敗画像のリスト化」など必要であれば、どんどんご要望ください！
+
+
