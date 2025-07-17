@@ -83,3 +83,80 @@ if __name__ == "__main__":
 
 用途や環境に合わせてチューニングも可能です。
 ご要望があれば、ファイル入力バージョン等も提示できます！
+
+
+
+はい、指定内容に合わせてデータEのみ3秒になるように処理フローを実装します。
+ポイントは
+	•	毎ステップで「0.5秒以降〜最後まで」のみを対象にノイズ除去し、その区間だけを次段階へ渡す
+	•	5回繰り返すことで最終的にEは5-0.5×4=3秒となる
+	•	Aは5秒, Eは3秒でwav保存
+
+⸻
+
+実装例
+
+import sounddevice as sd
+import numpy as np
+import scipy.io.wavfile as wav
+import noisereduce as nr
+
+FS = 16000
+DURATION = 5           # 録音時間[s]
+NOISE_PROFILE_SEC = 0.5
+
+def record_audio(duration, fs):
+    print(f"{duration}秒間録音中...")
+    audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='float32')
+    sd.wait()
+    return audio.flatten()
+
+def save_wav(filename, data, fs):
+    wav.write(filename, fs, (data * 32767).astype(np.int16))
+
+def noise_reduce_sub(data, fs, noise_profile_sec):
+    prof_samples = int(noise_profile_sec * fs)
+    # プロファイル取得
+    noise_profile = data[:prof_samples]
+    # 0.5秒以降のみ対象
+    target = data[prof_samples:]
+    # ノイズ除去
+    reduced = nr.reduce_noise(y=target, y_noise=noise_profile, sr=fs)
+    return reduced  # プロファイル部分は渡さない
+
+def main():
+    # 1. 録音
+    A = record_audio(DURATION, FS)
+    save_wav("A.wav", A, FS)  # 5秒
+
+    # 2. 0.5秒以降をノイズ除去→B (4.5秒)
+    B = noise_reduce_sub(A, FS, NOISE_PROFILE_SEC)
+    # 3. 0.5秒以降をノイズ除去→C (4.0秒)
+    C = noise_reduce_sub(B, FS, NOISE_PROFILE_SEC)
+    # 4. 0.5秒以降をノイズ除去→D (3.5秒)
+    D = noise_reduce_sub(C, FS, NOISE_PROFILE_SEC)
+    # 5. 0.5秒以降をノイズ除去→E (3.0秒)
+    E = noise_reduce_sub(D, FS, NOISE_PROFILE_SEC)
+
+    # 6. 保存
+    save_wav("E.wav", E, FS)  # 3秒
+
+    print("A.wav(5秒), E.wav(3秒) を保存しました")
+
+if __name__ == "__main__":
+    main()
+
+
+⸻
+
+【補足】
+	•	noise_reduce_sub関数は、「先頭0.5秒をノイズプロファイルとして残り全体をノイズ除去し、プロファイル部分は返さない」仕様です。
+	•	ステップごとに0.5秒短くなり、最終的にEは3秒。
+	•	途中のB～Dも同様の長さ変化です。
+	•	入力はマイクですが、wavファイル読み込みにもすぐ対応できます。
+
+⸻
+
+ご要望通りの挙動です。
+wavファイル読み込み/保存やサンプリングレート変更、進捗ログ追加等、追加要望もあればすぐ出せます。
+
