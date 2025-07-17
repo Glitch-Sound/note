@@ -183,3 +183,27 @@ plot_spectrogram(E, FS, title="E (Normalized) Spectrogram")
 
 
 
+
+import numpy as np
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+
+def save_librosa_spectrogram_image(data, fs, filename):
+    D = librosa.stft(data)
+    S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+    plt.figure(figsize=(10, 4))
+    librosa.display.specshow(S_db, sr=fs, x_axis='time', y_axis='hz', cmap='magma')
+    plt.colorbar(format='%+2.0f dB')
+    plt.title('Spectrogram (librosa)')
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()  # 画像ウィンドウを閉じる
+
+# 例: E（正規化済みデータ）のスペクトログラム画像を保存
+save_librosa_spectrogram_image(E_norm, FS, "E_spectrogram.png")
+
+
+
+
+
