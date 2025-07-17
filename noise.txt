@@ -1,0 +1,85 @@
+以下は、Pythonで指定の音声処理フローを実現するサンプルコードです。
+
+本例では、
+	•	マイク入力で5秒間録音
+	•	noisereduceライブラリでノイズ除去を段階的に4回実施
+	•	各段階ごとに先頭0.5秒をノイズプロファイルとし、以降を処理
+	•	最初(A)と最終(E)の音声をwavファイル保存
+
+に対応しています。
+
+⸻
+
+必要なパッケージ
+	•	sounddevice
+	•	scipy
+	•	noisereduce
+	•	numpy
+
+pip install sounddevice scipy noisereduce numpy
+
+
+⸻
+
+コード全体
+
+import sounddevice as sd
+import numpy as np
+import scipy.io.wavfile as wav
+import noisereduce as nr
+
+DURATION = 5          # seconds
+FS = 16000            # sample rate
+NOISE_PROFILE_SEC = 0.5
+
+def record_audio(duration, fs):
+    print(f"Recording {duration}秒...")
+    audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='float32')
+    sd.wait()
+    return audio.flatten()
+
+def save_wav(filename, data, fs):
+    # -1.0〜1.0のfloat→16bit intへ変換
+    wav.write(filename, fs, (data * 32767).astype(np.int16))
+
+def reduce_noise(data, fs, noise_profile_sec):
+    prof_samples = int(noise_profile_sec * fs)
+    noise_profile = data[:prof_samples]
+    target = data[prof_samples:]
+    reduced = nr.reduce_noise(y=target, y_noise=noise_profile, sr=fs)
+    return np.concatenate([noise_profile, reduced])
+
+def main():
+    # 1. 5秒間録音→A
+    A = record_audio(DURATION, FS)
+    save_wav("A.wav", A, FS)
+
+    # 2. A: 0.5秒ノイズプロファイルで残りをノイズ除去→B
+    B = reduce_noise(A, FS, NOISE_PROFILE_SEC)
+    # 3. B: 0.5秒ノイズプロファイルで残りをノイズ除去→C
+    C = reduce_noise(B, FS, NOISE_PROFILE_SEC)
+    # 4. C: 0.5秒ノイズプロファイルで残りをノイズ除去→D
+    D = reduce_noise(C, FS, NOISE_PROFILE_SEC)
+    # 5. D: 0.5秒ノイズプロファイルで残りをノイズ除去→E
+    E = reduce_noise(D, FS, NOISE_PROFILE_SEC)
+
+    # 6. AとEを保存
+    save_wav("A.wav", A, FS)
+    save_wav("E.wav", E, FS)
+    print("A.wav, E.wav を保存しました。")
+
+if __name__ == "__main__":
+    main()
+
+
+⸻
+
+補足
+	•	このまま動かせば、カレントディレクトリにA.wav（元音声）, E.wav（4段階ノイズ除去済） が出力されます。
+	•	入力はマイクですが、wavファイルから読み込む場合はscipy.io.wavfile.readを使ってください。
+	•	ノイズ除去の効果はプロファイル次第です。より安定したプロファイルにしたい場合、無音部分を長めにするなど調整してください。
+
+⸻
+
+用途や環境に合わせてチューニングも可能です。
+ご要望があれば、ファイル入力バージョン等も提示できます！
