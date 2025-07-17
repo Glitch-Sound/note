@@ -160,3 +160,26 @@ if __name__ == "__main__":
 ご要望通りの挙動です。
 wavファイル読み込み/保存やサンプリングレート変更、進捗ログ追加等、追加要望もあればすぐ出せます。
 
+
+
+
+import matplotlib.pyplot as plt
+from scipy import signal
+
+def plot_spectrogram(data, fs, title="Spectrogram"):
+    f, t, Sxx = signal.spectrogram(data, fs)
+    plt.figure(figsize=(10, 4))
+    plt.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-12), shading='gouraud')
+    plt.ylabel('Frequency [Hz]')
+    plt.xlabel('Time [sec]')
+    plt.title(title)
+    plt.colorbar(label='Level [dB]')
+    plt.tight_layout()
+    plt.show()
+
+# 例: Eのスペクトログラム
+plot_spectrogram(E, FS, title="E (Normalized) Spectrogram")
+
+
+
+
