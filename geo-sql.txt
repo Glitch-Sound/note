@@ -280,3 +280,99 @@ NetTopologySuite利用	Apache 2.0	△	◎（場合あり）	.NET側で空間型�
 
 
 
+
+
+
+分かりやすく整理します！
+
+⸻
+
+1. BULK INSERT（T-SQLコマンド）
+
+概要
+	•	SQL ServerのT-SQLコマンドで実装
+	•	SQL Serverに直接「ファイル（CSVなど）」を読み込ませて、一括でテーブルに取り込む
+	•	例：
+
+BULK INSERT dbo.TableName
+FROM 'C:\data\data.csv'
+WITH (FIELDTERMINATOR = ',', ROWTERMINATOR = '\n');
+
+
+
+メリット
+	•	DBサーバで直接実行できる（C#等アプリ不要）
+	•	非常に高速
+	•	SQL Server Management Studio（SSMS）などからも実行可能
+	•	SQLAgentやストアドプロシージャ等でも実行可能
+
+デメリット
+	•	ファイルはSQL Serverからアクセス可能な場所に必要（ローカル、もしくは共有フォルダ等）
+	•	細かいデータ検証や変換はしづらい
+	•	アプリ側で動的にファイル生成/転送が必要
+	•	エラーハンドリングがやや大味
+	•	SQLServerの権限設定やパス指定等が面倒なことも
+
+適切なケース
+	•	大量のCSV/TSVファイルを手作業やバッチでまとめて投入したい場合
+	•	データ形式が単純で変換不要な場合
+	•	DB管理者主導でデータ移行・初期データ流し込み等
+
+⸻
+
+2. SqlBulkCopy（.NETのC#クラス）
+
+概要
+	•	.NETのC#プログラムから使うクラス
+	•	メモリ上のDataTableやIDataReader、DataRow配列などをSQL Serverのテーブルに一括投入
+	•	例：
+
+using (var bulkCopy = new SqlBulkCopy(connectionString))
+{
+    bulkCopy.DestinationTableName = "dbo.TableName";
+    bulkCopy.WriteToServer(dataTable);
+}
+
+
+
+メリット
+	•	アプリ側でデータ加工・検証・編集後に一括投入できる
+	•	ファイル化不要（メモリ上のデータでOK）
+	•	エラー処理やログ記録、分割投入も柔軟
+	•	クラウド（Azure SQL）等、ファイルパス要らずでOK
+	•	UIやWebAPI等アプリケーションとの連携が得意
+
+デメリット
+	•	アプリ側の実装が必要
+	•	メモリに載せられる分だけ一括投入（極端な大容量は工夫要）
+	•	ファイル→DBだけのシンプル作業にはややオーバースペックな場合も
+
+適切なケース
+	•	Webサービスや業務アプリからデータ一括投入したい場合
+	•	取り込み前にアプリでデータ変換・チェックしたい場合
+	•	クラウドDBで直接ファイルパス指定できない場合（＝SqlBulkCopyが活躍）
+
+⸻
+
+まとめ表
+
+	BULK INSERT	SqlBulkCopy
+利用場所	SQLServer(T-SQL)	C#アプリ（.NET）
+データ元	サーバ上のファイル	DataTable等メモリデータ
+処理速度	◎（大量向き）	◎（大量向き）
+柔軟性	△（変換しにくい）	◎（事前加工できる）
+クラウド対応	△（ファイル制約有）	◎（クラウドDB対応可）
+権限・設定	やや厳しめ	標準DB接続でOK
+エラー制御	△	◎
+
+
+⸻
+
+選び方・まとめ
+	•	「大量のファイルを一気に流したい」「変換不要」→BULK INSERT
+	•	「アプリ側でデータ変換やバリデーションをしたい」「ファイルレスでクラウド対応も」→SqlBulkCopy
+
+⸻
+
+もしどちらが向いているか迷ったら運用形態・システム要件を教えてもらえれば、より具体的なアドバイスもできます！
+
