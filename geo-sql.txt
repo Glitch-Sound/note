@@ -1,0 +1,113 @@
+C#でSqlGeography型カラムを持つSQL ServerテーブルにBULK INSERTを行う場合、
+通常のBULK INSERT（SqlBulkCopyやBULK INSERTコマンド）はジオメトリ型のバイナリを直接流し込むことができません。
+ジオメトリ型のカラム（geometryやgeography）にはWKT（Well-Known Text）やWKB（Well-Known Binary）等の形式でデータを用意し、INSERT時に変換する必要があります。
+
+アプローチ例
+	1.	一時テーブルに文字列（WKTなど）で取り込む
+	2.	INSERT ... SELECTで本テーブルに変換して格納
+
+⸻
+
+サンプル構成
+
+1. テーブル例
+
+CREATE TABLE dbo.SampleTable (
+    Id INT PRIMARY KEY,
+    Name NVARCHAR(100),
+    Location geography  -- ← SqlGeography型
+);
+
+2. 一時テーブル（BULK INSERT用、Locationは文字列）
+
+CREATE TABLE dbo.SampleTable_Staging (
+    Id INT,
+    Name NVARCHAR(100),
+    LocationWkt NVARCHAR(MAX)   -- ← WKT形式
+);
+
+
+⸻
+
+3. CSVファイル例
+
+Id,Name,LocationWkt
+1,PointA,POINT(139.700556 35.689444)
+2,PointB,POINT(135.498333 34.693889)
+
+
+⸻
+
+4. C#でのBULK INSERTサンプル
+
+4-1. ステージングテーブルへのBulkCopy
+
+using System.Data;
+using System.Data.SqlClient;
+
+var connStr = "Server=localhost;Database=YOUR_DB;Trusted_Connection=True;";
+using var conn = new SqlConnection(connStr);
+conn.Open();
+
+var bulk = new SqlBulkCopy(conn)
+{
+    DestinationTableName = "dbo.SampleTable_Staging"
+};
+
+var dt = new DataTable();
+dt.Columns.Add("Id", typeof(int));
+dt.Columns.Add("Name", typeof(string));
+dt.Columns.Add("LocationWkt", typeof(string));
+
+// サンプルデータ追加
+dt.Rows.Add(1, "PointA", "POINT(139.700556 35.689444)");
+dt.Rows.Add(2, "PointB", "POINT(135.498333 34.693889)");
+
+bulk.WriteToServer(dt);
+
+
+⸻
+
+4-2. ステージング→本テーブルへのINSERT（SQL）
+
+INSERT INTO dbo.SampleTable (Id, Name, Location)
+SELECT
+    Id,
+    Name,
+    geography::STGeomFromText(LocationWkt, 4326)
+FROM dbo.SampleTable_Staging;
+
+
+⸻
+
+5. まとめ
+	•	BULK INSERTの本体はWKT形式で投入
+	•	後処理でgeography型へ変換
+
+⸻
+
+補足：一括処理をC#で行う例
+
+C#から後処理までやる場合：
+
+using (var cmd = new SqlCommand(
+    @"INSERT INTO dbo.SampleTable (Id, Name, Location)
+      SELECT Id, Name, geography::STGeomFromText(LocationWkt, 4326)
+      FROM dbo.SampleTable_Staging", conn))
+{
+    cmd.ExecuteNonQuery();
+}
+
+
+⸻
+
+直接SqlBulkCopyでSqlGeography型は使えない
+	•	DataTableやSqlBulkCopyで SqlGeography オブジェクトを直接投入することはできません（シリアライズが必要）。
+	•	WKTなどを使い、一時テーブル→変換がベストプラクティス。
+
+⸻
+
+ご質問の「サンプルコード」はこの流れが一般的です。
+もし「CSV→SQLServer一発で地理データ投入」など特別な要望があれば教えてください。
+
+
