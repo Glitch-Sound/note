@@ -374,5 +374,59 @@ using (var bulkCopy = new SqlBulkCopy(connectionString))
 
 ⸻
 
-もしどちらが向いているか迷ったら運用形態・システム要件を教えてもらえれば、より具体的なアドバイスもできます！
+もしどちらが向いているか迷ったら運用形態・システム要件を教えてもらえれば、より具体的なアドバイスもできはい、基本的に SqlBulkCopy で SqlGeography 型（geography カラム）を
+直接投入することはできません（＝SqlGeography型のカラムはC#側のDataTableでそのまま渡せない）。
+そのため「一時テーブル（文字列カラム/WKTなど）を経由して2段階でINSERT」という方法が現実的・一般的です。
+
+⸻
+
+なぜ直接できない？
+	•	SqlBulkCopy は SqlGeography 型（.NET側）を自動的にSQLServerの geography 型（DBカラム）に変換して渡す仕組みを持たない
+	•	DataTable/Readerで文字列や数値型はマッピングできるが、SqlGeographyのままだと失敗する
+	•	「NTS（NetTopologySuite）」等を使ってバイナリ化＆型情報追加すれば投入できる場合もあるが、純正C#/.NETだけでは直接投入不可
+
+⸻
+
+2段階INSERT方法は王道
+	•	一時テーブルのカラムは nvarchar(max) などの文字列型（WKT/WKB/GML）にする
+	•	SqlBulkCopyで一時テーブルにBULK投入
+	•	T-SQLで geography::STGeomFromText(...) などの変換関数を使い本番テーブルにINSERT
+
+⸻
+
+例
+	1.	一時テーブル作成（LocationWktカラム）
+
+CREATE TABLE dbo.TempTable (
+    Id INT,
+    Name NVARCHAR(100),
+    LocationWkt NVARCHAR(MAX)
+);
+
+
+	2.	C#でDataTable生成、SqlBulkCopyで一時テーブルに書き込む
+	3.	T-SQLで変換INSERT
+
+INSERT INTO dbo.RealTable (Id, Name, Location)
+SELECT Id, Name, geography::STGeomFromText(LocationWkt, 4326)
+FROM dbo.TempTable
+
+
+
+⸻
+
+結論
+	•	「2段階でinsertする方法で問題ない」です！
+	•	現場でもこの方式が「保守性・移行性・安定性」で王道です
+	•	外部ライブラリを使わない標準的な運用として一番おすすめです
+
+⸻
+
+疑問が解消しきれていなければ、さらに深堀りもできますので、気軽にどうぞ！
+
+
+
+
+
+
 
