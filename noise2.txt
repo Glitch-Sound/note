@@ -1,0 +1,96 @@
+もちろんです。
+精度を上げる対策を含めて、Pythonで「A.wav（環境音）」を複数ファイルとして利用、平均ノイズプロファイルを作成し、「B.wav（カチッ音入り）」から環境音を除去して「C.wav」を作る発展的サンプルを示します。
+
+⸻
+
+精度を上げるためのポイント
+	1.	複数の環境音（A1.wav, A2.wav, …）を平均化して「ノイズプロファイル」を作成
+	2.	ステレオ（2ch）の場合は左右それぞれ処理
+	3.	noisereduceのパラメータ調整（例：prop_decrease, freq_mask_smooth_hzなど）
+	4.	出力の音量正規化（ノーマライズ）も追加
+
+⸻
+
+コード例
+
+import os
+import numpy as np
+import soundfile as sf
+import noisereduce as nr
+
+def load_and_resample(file, sr_ref):
+    data, sr = sf.read(file)
+    if sr != sr_ref:
+        raise ValueError(f"Sample rate mismatch: {file} ({sr} != {sr_ref})")
+    # ステレオの場合、モノラルへ変換
+    if len(data.shape) == 2:
+        data = np.mean(data, axis=1)
+    return data
+
+def normalize(y):
+    return y / (np.max(np.abs(y)) + 1e-8)
+
+# 1. 複数の環境音ファイルを平均化してノイズプロファイルを作成
+env_dir = "env_audios"  # ここにA1.wav, A2.wav...を入れる
+env_files = [os.path.join(env_dir, f) for f in os.listdir(env_dir) if f.endswith('.wav')]
+assert len(env_files) > 0, "環境音ファイルがありません"
+
+# サンプリングレートを決めるため最初のファイルで取得
+tmp, sr = sf.read(env_files[0])
+if len(tmp.shape) == 2:
+    tmp = np.mean(tmp, axis=1)
+env_data_list = [tmp]
+
+for f in env_files[1:]:
+    d = load_and_resample(f, sr)
+    # 長さ揃え
+    if len(d) > len(tmp):
+        d = d[:len(tmp)]
+    elif len(d) < len(tmp):
+        tmp = tmp[:len(d)]
+        env_data_list = [e[:len(d)] for e in env_data_list]
+    env_data_list.append(d)
+
+# 平均ノイズプロファイル作成
+noise_profile = np.mean(env_data_list, axis=0)
+
+# 2. カチッ音入りB.wavを読み込み
+input_file = "B.wav"
+input_data, sr2 = sf.read(input_file)
+assert sr == sr2, "B.wavのサンプリングレートが異なります"
+
+if len(input_data.shape) == 2:
+    input_data = np.mean(input_data, axis=1)
+
+# 3. ノイズリダクション（パラメータも調整可）
+reduced = nr.reduce_noise(
+    y=input_data,
+    y_noise=noise_profile,
+    sr=sr,
+    prop_decrease=1.0,         # ノイズ抑制の強さ（1.0が最大、0.5くらいから試すと良い）
+    freq_mask_smooth_hz=300,   # マスクの平滑化（周波数軸, default=500Hz）
+    time_mask_smooth_ms=40,    # マスクの平滑化（時間軸, default=80ms）
+    n_std_thresh_stationary=1.5  # ノイズのしきい値（default=1.5、2.0で安全寄り）
+)
+
+# 4. 出力の音量をノーマライズ
+reduced = normalize(reduced)
+
+# 5. 保存
+sf.write("C.wav", reduced, sr)
+print("ノイズ除去＋ノーマライズ済みのC.wavを生成しました。")
+
+
+⸻
+
+各ポイント詳細
+	•	複数環境音→ノイズプロファイル：環境音に一部バリエーションがあっても、平均することで頑健になります。
+	•	ステレオ→モノラル変換：実験用にモノラルで処理（必要なら左右別々でもOK）。
+	•	prop_decrease：大きいほど強くノイズ除去、強すぎるとカチッ音も消えるので調整を。
+	•	normalize()：ピーク音量が1になるよう正規化し、聞きやすくします。
+
+⸻
+
+このまま現場に適用しつつ、「もっと取り付け音を強調したい」場合や、「一部だけ強くノイズ除去したい」なども相談可能です。
+
+ファイル構成やより細かい現場向け最適化もアドバイスできるので、気軽にご相談ください！
