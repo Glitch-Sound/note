@@ -1,0 +1,188 @@
+PostgreSQLをPythonのProcessPoolExecutorマルチプロセスで書き込み利用する場合、サブプロセスごとにコネクションやセッションを完全に分離する必要があります。また、PostgreSQL自体は高い並列性を持ちますが、同じテーブルや一意制約付きカラムへ同時に同一値をinsertしようとすると「一意制約違反」などのエラーが発生します。
+
+競合が発生する主な原因
+	•	同じレコードを複数プロセスがinsertしようとした（一意制約違反や排他ロック争い）
+	•	コネクション/セッションを親プロセスで作り、それを子プロセスで使い回している（これもNG）
+
+⸻
+
+サンプル構成
+	•	テーブル: sample(id serial primary key, value text unique)
+	•	競合しない値でinsertする（ランダム値 or id自動採番）
+	•	コネクションはサブプロセスごとに新規作成
+
+⸻
+
+サンプルコード
+
+ここでは**psycopg2**を使用します。
+
+import psycopg2
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import random
+import string
+
+DB_DSN = "host=localhost dbname=yourdb user=youruser password=yourpass"
+
+def insert_data(value: str):
+    # 各プロセスで新たにコネクションを確立
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO sample (value) VALUES (%s)", (value,))
+        return True
+    except Exception as e:
+        print(f"Insert error: {e} (value={value})")
+        return False
+    finally:
+        conn.close()
+
+def random_value():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+
+if __name__ == "__main__":
+    num_workers = 4  # サブプロセス数
+    num_inserts = 20
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for _ in range(num_inserts):
+            val = random_value()  # 競合しない値を作成
+            futures.append(executor.submit(insert_data, val))
+
+        for future in as_completed(futures):
+            result = future.result()
+            print("Insert success" if result else "Insert failed")
+
+
+⸻
+
+競合が発生するパターン例（失敗例）
+
+例えばすべてのプロセスがinsert_data("test")のように同じ値を同じ一意制約カラムに挿入しようとすると、どれか1つ以外はエラーになります。
+
+for _ in range(num_inserts):
+    futures.append(executor.submit(insert_data, "test"))  # ←競合確定
+
+この場合、PostgreSQL側で duplicate key value violates unique constraint エラーが発生します。
+
+⸻
+
+ポイントまとめ
+	1.	コネクション/カーソルは必ずサブプロセス内で作る
+	2.	同じ一意制約カラムに同じ値を複数プロセスからinsertしない
+→ 必要ならinsert前にselectして存在確認or ON CONFLICT DO NOTHINGを使う
+	3.	DB側の排他制御・トランザクションも考慮する
+
+⸻
+
+競合を回避したい場合（upsert例）
+
+cur.execute("""
+    INSERT INTO sample (value)
+    VALUES (%s)
+    ON CONFLICT (value) DO NOTHING
+""", (value,))
+
+
+⸻
+
+もしテーブル構造やinsert値の生成方法が特殊、あるいは競合の再現例が欲しい場合は、その詳細を教えていただければさらにピンポイントでサンプルを作ります！
+
+⸻
+
+
+
+-------------
+
+競合（例えば一意制約違反）を確実にカバーするには、PostgreSQLのON CONFLICT句を活用するのが最もシンプルで堅牢です。
+
+⸻
+
+主な方法
+
+1. ON CONFLICT DO NOTHING
+	•	既存の一意制約違反が起きそうな場合、何もしない（エラーにならずスルー）
+
+cur.execute(
+    "INSERT INTO sample (value) VALUES (%s) ON CONFLICT (value) DO NOTHING",
+    (value,)
+)
+
+この場合、重複値がinsertされてもエラーにならず、何も挿入されません。
+
+⸻
+
+2. ON CONFLICT DO UPDATE
+	•	もし重複した場合に、既存レコードを更新する
+
+cur.execute(
+    "INSERT INTO sample (value) VALUES (%s) ON CONFLICT (value) DO UPDATE SET value = EXCLUDED.value",
+    (value,)
+)
+
+※この例では「値が同じなら更新しても意味がない」ですが、他に更新したいカラムがあればそちらも指定できます。
+
+⸻
+
+3. Python側でリトライ／エラーハンドリング
+	•	上記のようなSQLでエラーを回避できない場合や、独自の挙動が必要な場合は
+exceptでリトライやスキップ処理を追加できます。
+
+def insert_data(value: str, max_retry=3):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        for _ in range(max_retry):
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO sample (value) VALUES (%s)",
+                            (value,)
+                        )
+                return True
+            except psycopg2.errors.UniqueViolation:
+                print(f"Unique error for value={value}, skipping.")
+                return False
+            except Exception as e:
+                print(f"Insert error: {e} (value={value}) - retrying")
+        return False
+    finally:
+        conn.close()
+
+※でもSQLのON CONFLICTの方が基本的には安全で高速です。
+
+⸻
+
+まとめ
+	•	競合が想定される場合はSQLのON CONFLICT句で明示的に制御するのが一番安全でおすすめ
+	•	Python側でエラーハンドリングやリトライを追加するのも補助策としてOK
+
+⸻
+
+サンプル（修正版）
+
+def insert_data(value: str):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sample (value) VALUES (%s) ON CONFLICT (value) DO NOTHING",
+                    (value,)
+                )
+        return True
+    except Exception as e:
+        print(f"Insert error: {e} (value={value})")
+        return False
+    finally:
+        conn.close()
+
+
+⸻
+
+まとめ：競合発生時は「ON CONFLICT」で安全にカバーできる。
+挙動をカスタマイズしたい場合はPythonで例外捕捉・リトライなどを組み合わせる。
+
+さらに細かい挙動（例えば「insertできなかった場合のみ何か追加処理したい」など）も柔軟にカスタムできますので、ご希望があればご相談ください。
