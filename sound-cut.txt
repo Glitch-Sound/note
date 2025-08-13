@@ -1,0 +1,128 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os
+import time
+import threading
+from queue import Empty
+from typing import TYPE_CHECKING
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+import multiprocessing as mp
+
+# 型注釈用（「Variable not allowed in type expression」対策）
+if TYPE_CHECKING:
+    from multiprocessing.synchronize import Event as MpEvent
+    from multiprocessing.queues import Queue as MpQueue
+
+FS = 44100          # サンプリング周波数
+SEC = 5             # 最大録音長（秒）
+CH  = 1             # モノラル
+
+CMD_START = "start"     # payload: {"path": "<wav path>"}
+CMD_STOP  = "stop"      # 途中停止（B）
+CMD_QUIT  = "quit"      # ワーカー終了
+
+def rec_worker(ctrl_q: 'MpQueue', done_q: 'MpQueue') -> None:
+    """
+    親から:
+      - ("start", {"path": ...})
+      - ("stop", None)
+      - ("quit", None)
+    を受け取り、録音→WAV保存して done_q に {"ok": True, "path": ...} を返す
+    """
+    while True:
+        cmd, payload = ctrl_q.get()
+        if cmd == CMD_QUIT:
+            break
+
+        if cmd != CMD_START:
+            # 無視して待ち直し
+            continue
+
+        out_path = payload["path"]
+        nmax = FS * SEC
+
+        buf = np.empty((nmax, CH), dtype=np.float32)
+        idx = 0                      # 現在まで詰めたサンプル数
+        stop_now = threading.Event() # B発生で True
+
+        # コールバック：受け取ったフレームをバッファに詰める
+        def callback(indata, frames, time_info, status):
+            nonlocal idx
+            if status:
+                # グリッチ等は必要に応じてログ
+                pass
+            n = min(frames, nmax - idx)
+            if n > 0:
+                buf[idx:idx+n, :] = indata[:n, :]
+                idx += n
+            # 5秒分埋まった or B指示が来たら止める
+            if idx >= nmax or stop_now.is_set():
+                raise sd.CallbackStop
+
+        # 録音開始
+        with sd.InputStream(samplerate=FS, channels=CH, dtype='float32',
+                            callback=callback, blocksize=0):
+            # 録音中は制御キューをポーリングして stop/quit を拾う
+            while True:
+                if stop_now.is_set():
+                    break
+                if idx >= nmax:
+                    break
+                try:
+                    c, _ = ctrl_q.get(timeout=0.05)
+                    if c == CMD_STOP:
+                        stop_now.set()
+                    elif c == CMD_QUIT:
+                        stop_now.set()
+                        # quit は録れた分だけ保存してからやめる
+                except Empty:
+                    pass
+
+        # 録れた分（idx サンプル）だけ保存
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        sf.write(out_path, buf[:idx, :], FS)
+        done_q.put({"ok": True, "path": out_path, "samples": idx})
+
+    done_q.put({"ok": True, "bye": True})
+
+
+def main():
+    if os.name == "nt":
+        mp.set_start_method("spawn", force=True)
+
+    ctrl_q: 'MpQueue' = mp.Queue()
+    done_q: 'MpQueue' = mp.Queue()
+    p = mp.Process(target=rec_worker, args=(ctrl_q, done_q))
+    p.start()
+
+    try:
+        # ===== ここは例：条件A/Bの発生をシミュレート =====
+        # 条件A：録音スタート
+        t = time.strftime("%Y%m%d_%H%M%S")
+        wav_path = f"./debug_sound/{t}.wav"
+        ctrl_q.put((CMD_START, {"path": wav_path}))
+
+        # 途中で条件Bが起きる想定：2.1秒後に通知
+        time.sleep(2.1)
+        ctrl_q.put((CMD_STOP, None))
+
+        # ワーカーからの完了を受け取る
+        res = done_q.get()
+        print("saved:", res)
+
+    finally:
+        ctrl_q.put((CMD_QUIT, None))
+        p.join(timeout=3)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
