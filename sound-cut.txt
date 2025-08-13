@@ -126,3 +126,54 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+
+
+
+FS = 44100  # sample rate
+
+def _save_librosa_spectrogram_image(filename: str, data, fs: int = FS):
+    import numpy as np, os, librosa, librosa.display, matplotlib.pyplot as plt
+
+    # --- 1) 1Dモノラルに正規化（(N,1) や (N,2) を吸収） ---
+    y = np.asarray(data)
+    if y.ndim == 2:
+        if y.shape[1] == 1:
+            y = y[:, 0]
+        else:
+            # (channels, n) を期待するので転置して to_mono
+            y = librosa.to_mono(y.T)
+    y = y.astype(np.float32, copy=False)
+
+    # 空や極端に短い場合はスキップ（お好みで空画像保存でもOK）
+    if y.size < 2:
+        return  # 何もせず戻る
+
+    # --- 2) 信号長に合わせて n_fft / hop を調整 ---
+    def pow2_floor(n: int) -> int:
+        import math
+        return 1 << max(6, int(math.floor(math.log2(max(1, n)))))  # 最小64
+
+    n_fft_default = 2048
+    if y.size >= n_fft_default:
+        n_fft = n_fft_default
+    else:
+        n_fft = pow2_floor(y.size)         # yの長さ以下で最大の2の冪
+        # 2048固定で描きたいなら↓代わりにゼロ埋め
+        # y = librosa.util.fix_length(y, size=n_fft_default); n_fft = n_fft_default
+
+    hop_length = max(1, n_fft // 4)
+
+    # --- 3) STFT → dB へ ---
+    D = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
+    S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+
+    # --- 4) 描画（使用した hop を渡すと x軸が正しくなる） ---
+    plt.figure(figsize=(10, 4))
+    librosa.display.specshow(S_db, sr=fs, hop_length=hop_length,
+                             x_axis="time", y_axis="log", cmap="magma")
+    plt.colorbar(format="%+2.0f dB")
+    plt.title(f"Spectrogram (librosa) n_fft={n_fft}, hop={hop_length}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PATH_DEST, filename))
+    plt.close()
+
