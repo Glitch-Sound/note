@@ -177,3 +177,37 @@ def _save_librosa_spectrogram_image(filename: str, data, fs: int = FS):
     plt.savefig(os.path.join(PATH_DEST, filename))
     plt.close()
 
+
+
+
+import numpy as np
+import noisereduce as nr
+
+def reduce_noise(data, noise_profile_sec, fs=FS):
+    # 1) dataを必ず1D(float32)にする
+    y = np.asarray(data, dtype=np.float32)
+    if y.ndim == 2:
+        # 典型: (n_frames, frame_len) → 直列化して1Dに
+        if y.shape[0] > 2 and y.shape[1] > 2:
+            y = y.reshape(-1)
+        # 典型: (T, C) / (C, T) → モノラル化
+        elif y.shape[0] in (1, 2):
+            y = y.mean(axis=0)          # (C, T)とみなす
+        elif y.shape[1] in (1, 2):
+            y = y.mean(axis=1)          # (T, C)とみなす
+        else:
+            y = y.reshape(-1)
+    elif y.ndim > 2:
+        y = y.reshape(-1)
+
+    # 2) ノイズプロファイルとターゲットを切り出し
+    prof_samples = int(noise_profile_sec * fs)
+    assert prof_samples < y.size, "noise_profile_sec が長すぎます"
+    noise_profile = y[:prof_samples]
+    target       = y[prof_samples:]
+
+    # 3) ノイズリダクション
+    reduced = nr.reduce_noise(y=target, y_noise=noise_profile, sr=fs)
+    return reduced
+
+
