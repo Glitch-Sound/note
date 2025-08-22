@@ -1,0 +1,61 @@
+結論だけ先に：MinIO自体には、AVI→MP4 の変換（トランスコード）機能はありません。 MinIO は S3 互換のオブジェクトストレージで、変換は外部の処理（例：FFmpeg）に任せる設計です。代わりに MinIO の「イベント通知」や「Object Lambda」を使って、外部の変換ワーカーを呼び出すのが定石です。 ￼
+
+実現パターン
+
+1) 非同期バッチ／イベント駆動で変換（おすすめ）
+	1.	raw バケットに AVI をアップロード
+	2.	Bucket Notification（ObjectCreated:Put 等）を使い、Webhook/Kafka/MQTT などへイベント送出
+	3.	受け側の**変換ワーカー（FFmpeg）**が MinIO から AVI を取得し、H.264/AAC の MP4 を生成
+	4.	生成した MP4 を processed バケット（または別プレフィックス）へ保存
+	5.	Lifecycle ルールで一定日数後に元の AVI を自動削除（必要なら）
+
+MinIO のイベント通知は Webhook/Kafka/MQTT など複数ターゲットに対応しています。設定は mc admin config set などで行えます。 ￼ ￼
+アップロード済みオブジェクトの自動削除は Lifecycle Management でルール化できます。 ￼ ￼
+
+最小セットアップ例（Webhook の場合）
+
+# Webhook エンドポイントを設定
+mc admin config set myminio notify_webhook:1 endpoint="http://transcoder:8080/hook" auth_token="SECRET"
+mc admin service restart myminio
+
+# raw バケットで PUT イベントを Webhook へ
+mc event add myminio/raw arn:minio:sqs::1:webhook --event put
+
+￼
+
+変換ワーカー側（擬似コード）：
+
+# 受け取った {bucket, object} を元に取得→変換→保存
+mc cp myminio/$bucket/$object /work/input.avi
+ffmpeg -i /work/input.avi -c:v libx264 -preset medium -crf 23 -c:a aac -movflags +faststart /work/output.mp4
+mc cp /work/output.mp4 myminio/processed/${object%.avi}.mp4 --attr "Content-Type=video/mp4"
+
+	•	-movflags +faststart はストリーミング開始を早くする定番オプションです。
+	•	類似構成のチュートリアル／サンプルも多数あります（FFmpeg＋MinIO を使う例）。 ￼ ￼
+
+ライフサイクルで元AVIを削除（任意）
+
+# 30日後に raw/ 配下のオブジェクトを期限切れにする例
+mc ilm rule add myminio/raw --expire-days 30
+
+￼
+
+2) オンデマンド変換（保存せず GET 時に変換）
+
+MinIO の Object Lambda を使うと、GET リクエスト時に外部関数で変換して、その結果だけを返すことも可能です（元オブジェクトは不変）。「都度変換」でストレージ節約になりますが、毎回の変換コストとレイテンシが発生します。用途が合えば有効です。 ￼ ￼
+
+⸻
+
+どちらを選ぶ？
+	•	配信頻度が高い／同じ動画を何度も再生 → 事前変換（パターン1）が実運用向き
+	•	たまに見るだけ／サイズ節約が最優先 → オンデマンド変換（パターン2）
+
+小さな注意点
+	•	コンテナ：変換ワーカーは Docker 化すると運用が楽（FFmpeg を同梱）。
+	•	権限：ワーカーには「raw 読み取り」「processed 書き込み」だけを付与。
+	•	MIME：MP4 保存時 Content-Type=video/mp4 を付与。
+	•	シーク可能配信：MinIO 直リンクやプリサインドURLは Range リクエスト対応。プロキシ配信する場合は Content-Range 等のヘッダ処理を忘れずに。
+
+⸻
+
+必要なら、あなたの構成（単体／分散MinIO、K8s有無、使いたいメッセージ基盤）に合わせた mc コマンド／Dockerfile／FFmpeg プリセットをこちらで作ります。
