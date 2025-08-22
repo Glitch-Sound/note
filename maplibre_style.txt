@@ -1,0 +1,175 @@
+その要件なら「ベースマップと重畳レイヤを疎結合に保ち、ユーザごとの“差分（オーバーライド）”だけを管理する」方式がいちばん運用がラクで拡張も効きます。以下に実装と運用の指針をまとめます。
+
+ゴール整理
+	•	OSMラスタは仮置き。将来は別ベース（自社タイル/他社ベクトル）へ切替え予定。
+	•	PostGIS の各種データを Martin で MVT 配信し、MapLibre で重畳。
+	•	複数ユーザが「表示レイヤ選択」「配色（HEX）」を自由に変更。
+	•	スタイルは MapLibre Style Spec（v8）に準拠したい。
+
+管理方式の選択肢
+	1.	スタイルをユーザごとに丸ごと生成（style.jsonを毎回出す）
+　→ 柔軟だが、キャッシュが効きにくく再読込コスト大。
+	2.	ベーススタイルは固定/キャッシュ、重畳はクライアントで追加・更新（推奨）
+　→ 変更は setPaintProperty/setLayoutProperty/setFilter で即時反映。ベース切替も容易。
+	3.	「テンプレ＋JSON Patch（差分）」をサーバでコンパイルして配信
+　→ 2)の発展。共有リンクやオフライン出力に便利。
+
+結論：まずは 2)（クライアントで重畳追加・差分適用） を基本に、必要に応じて 3) を併用。
+
+サーバ側：データモデル（例）
+	•	tile_source：Martin 側エンドポイント定義
+	•	id, tiles_url, minzoom, maxzoom, source_layers[]（MVT 内の layer 名）
+	•	layer_template：地物ごとのレイヤ定義テンプレ（Style Spec 断片）
+	•	id, source_id, source_layer, type（fill/line/symbol など）, default_paint, default_layout, filters, metadata（凡例・カテゴリなど）
+	•	style_preset：運営側が用意する色や分類のプリセット
+	•	id, layer_id, palette, classification（equal/quantile/jenks など）, breaks
+	•	user_layer_pref：ユーザごとのオーバーライド
+	•	user_id, layer_id, visible, color（HEX）, opacity, line-width などの上書き、order、任意のfilter
+
+ポイント：**テンプレ（template）**はStyle Specに準拠、**ユーザ設定（pref）**はテンプレに対する差分だけを持つ。
+
+Martin 側の設計メモ
+	•	source-layer 名は将来変更しない前提で安定名に。変更が必要なら tileset_version を上げて別URLに（後方互換）。
+	•	タイルは CDN/キャッシュ前提のURL命名に。
+	•	ACL が必要なら Martin の前段 Nginx でトークン検証（もしくは署名付きURL）。
+
+フロント（Vue + MapLibre）：実装の要点
+	•	ベースマップ読み込み後に、重畳ソース/レイヤを動的に追加。
+	•	ユーザ操作は Pinia に集中管理。store が変われば MapLibre のプロパティを更新。
+	•	レイヤの on/off は map.setLayoutProperty(id, 'visibility', 'none'|'visible')。色は map.setPaintProperty。
+	•	スタイル再読込時の再追加：map.on('styledata'|'load') で重畳を再 attach（ベース切替に強い）。
+
+ざっくりコード（Composition API）
+
+// useMapStore.ts（Pinia）
+export const useMapStore = defineStore('map', {
+  state: () => ({
+    ready: false,
+    userPrefs: {
+      // layerId ごとに
+      roads: { visible: true, color: '#3A86FF', width: 2 },
+      parcels: { visible: false, fill: '#FFBE0B', opacity: 0.4 },
+    }
+  }),
+  actions: {
+    applyPrefs(map: maplibregl.Map) {
+      for (const [id, pref] of Object.entries(this.userPrefs)) {
+        if (map.getLayer(id)) {
+          map.setLayoutProperty(id, 'visibility', pref.visible ? 'visible' : 'none');
+          if (pref.color) map.setPaintProperty(id, 'line-color', pref.color);
+          if (pref.width) map.setPaintProperty(id, 'line-width', pref.width);
+          if (pref.fill) map.setPaintProperty(id, 'fill-color', pref.fill);
+          if (pref.opacity !== undefined) map.setPaintProperty(id, 'fill-opacity', pref.opacity);
+        }
+      }
+    }
+  }
+});
+
+// MapView.vue（抜粋）
+onMounted(() => {
+  const map = new maplibregl.Map({ container: 'map', style: baseStyleUrl });
+  const store = useMapStore();
+
+  map.on('load', () => {
+    // 1) ソース追加
+    map.addSource('roads', {
+      type: 'vector',
+      tiles: ['https://tiles.example.com/roads/{z}/{x}/{y}.pbf'],
+      minzoom: 5, maxzoom: 14
+    });
+
+    // 2) レイヤ追加（テンプレ適用）
+    map.addLayer({
+      id: 'roads',
+      type: 'line',
+      source: 'roads',
+      'source-layer': 'roads',
+      paint: { 'line-color': '#3A86FF', 'line-width': 2 }
+    }, /* beforeId */ 'label-layer');
+
+    // 他レイヤもテンプレから同様に…
+
+    store.ready = true;
+    store.applyPrefs(map); // ユーザ差分を適用
+  });
+
+  // ベーススタイル切替に備えて再適用
+  map.on('styledata', () => {
+    if (!store.ready) return;
+    // ソース/レイヤが消えるので再 attach（存在チェックしつつ）
+    // attachOverlaySourcesAndLayers(map, templates);
+    store.applyPrefs(map);
+  });
+
+  // ユーザ設定が変わったら即反映
+  watch(() => store.userPrefs, () => store.applyPrefs(map), { deep: true });
+});
+
+配色の扱い（データ駆動）
+	•	カテゴリ別：["match", ["get","category"], "A", "#FF006E", "B", "#8338EC", "#BDBDBD"]
+	•	連続値：["interpolate", ["linear"], ["get","score"], 0, "#E0F7FA", 100, "#006064"]
+	•	ユーザが色だけ変えるなら paintプロパティを上書きが最小コスト。
+分級（閾値）やパレット変更が必要なら、サーバで分布統計を返すAPIを用意（PostGIS の percentile_disc 等）→ 分級を計算 → paint の式を再設定。
+
+ベースマップ切替への備え
+	•	ベースは完全に別扱い：ベースの style.json と重畳は混ぜない。
+	•	切替時は map.setStyle(newBaseStyleUrl) → styledata/load で重畳を再 attach。
+	•	beforeId を使って、重畳が常にラベルの下/上など狙った順序になるようグループ化（例：overlay-bg/overlay-fg 仮想レイヤの前後を基準に追加）。
+
+スタイルテンプレの持ち方（例）
+
+テンプレ断片は Style Spec 準拠にしつつ、metadata にUIヒントを同梱。
+
+{
+  "id": "parcels",
+  "type": "fill",
+  "source": "parcels",
+  "source-layer": "parcels",
+  "paint": {
+    "fill-color": "#FFBE0B",
+    "fill-opacity": 0.5,
+    "fill-outline-color": "#5A5A5A"
+  },
+  "metadata": {
+    "legend": "地番",
+    "ui": { "allowColorPick": true, "allowOpacity": true },
+    "defaultOrder": 300
+  }
+}
+
+ユーザ設定（差分）の表現（例）
+
+{
+  "user_id": "u_123",
+  "layers": [
+    { "id": "parcels", "visible": true, "fill": "#1E88E5", "opacity": 0.35, "order": 320 },
+    { "id": "roads",   "visible": false }
+  ]
+}
+
+DB にはこの差分のみ保存。初期表示は layer_template を読み込み→ user_layer_pref を適用。
+
+権限・公開制御
+	•	layer_template に visibility_scope（public/internal/role-based）を持たせ、UI に出す前にサーバでフィルタ。
+	•	タイルURLは利用者以外に漏らさない。必要なら Nginx で短期署名を発行。
+
+パフォーマンスと運用
+	•	レイヤ数は厳選：同一タイルに対してスタイル式で表現できるならレイヤを増やさない（凡例の都合で分けるのはOK）。
+	•	feature-state はハイライト等に限定（永続色替えは paint 上書きで十分）。
+	•	テンプレとユーザ差分は ETag/Cache-Control を活用（ハッシュ化キーに）。
+	•	バージョニング：style_schema_version を持ち、テンプレ更新時にユーザ差分をマイグレート（未知キーは無視）。
+
+共有・エクスポート
+	•	現在の差分を JSON で共有リンク化（短縮URLに保存）。
+	•	必要ならサーバ側でフル style.json をコンパイルしてダウンロード提供（3)の併用）。
+
+最初の一歩（実装順）
+	1.	Martin の tileset と source-layer 名を固定化（命名規約と versioning ルールを文書化）。
+	2.	layer_template を JSON で用意（Style Spec 準拠＋metadata）。
+	3.	Vue+MapLibre で テンプレから重畳を動的追加 → Pinia で差分適用。
+	4.	user_layer_pref を永続化（色は #RRGGBB を基本に）。
+	5.	ベーススタイル切替ハンドラ（styledata で再 attach）を実装。
+	6.	統計API（分級用）とプリセット機能を追加。
+
+この設計なら、ベースマップの将来切替に強く、ユーザ別カスタムも差分だけで軽量に管理できます。必要なら、テンプレ/差分の JSON スキーマ雛形や、レイヤ再 attach のユーティリティ関数も用意しますよ。
