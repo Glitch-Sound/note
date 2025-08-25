@@ -1,0 +1,84 @@
+とあるubuntuマシンにて現状以下のdocker composeで動いているシステムがある
+
+docker-compose version 1.17.1
+
+別のシステムを動かしたいが、そちらは以下以上のバージョンが必要となる
+
+docker compose version 2.18.1
+
+上記について2点確認となる
+
+確認①
+既存システムに影響させないため、元のdocker-composeを残したいが、こちらを残したまま別バージョンのdocker composeを共存させることは可能か
+
+確認②
+docket-composeとdocker composeの違いを教えてほしい
+
+---
+
+了解です。要点だけサクッとまとめます。
+
+確認①：共存できる？
+
+できます。
+既存の docker-compose（v1系・ハイフンあり）をそのまま残しつつ、Docker Compose v2 を Docker CLIプラグイン（docker compose：スペース区切り）として入れれば共存します。プラグインは通常、/usr/local/lib/docker/cli-plugins/docker-compose または ~/.docker/cli-plugins/docker-compose に置きます。 ￼
+
+手順（Ubuntu・最短）
+	1.	まず現状確認
+
+docker-compose --version
+docker compose version
+
+	2.	公式リポジトリ経由（自動アップデートされやすい）
+
+sudo apt-get update
+sudo apt-get install -y docker-compose-plugin
+docker compose version
+
+（これで docker compose が使えるようになります） ￼
+	3.	特定バージョン（例：v2.18.1）を固定したい場合（手動配置）
+
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -L https://github.com/docker/compose/releases/download/v2.18.1/docker-compose-linux-x86_64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version
+
+（手動配置は自動更新されない点だけ注意） ￼
+
+既存システムを壊さないコツ
+	•	docker-compose を上書きしない/シンボリックリンクにしない（ハイフンありの呼び出しはv1のままにしておく）
+	•	プロジェクト名の衝突回避に -p もしくは Compose ファイルの top-level name: を使う
+
+docker-compose -p legacy up -d
+docker compose  -p newapp up -d
+
+name: は Compose 仕様の正式機能です。 ￼
+
+なお、Compose v1はすでにEOL（最終版1.29.2は2021/05/10、以降は更新なし）です。どうしてもv1が必要な場合だけ限定利用にし、セキュリティリスクは理解しておきましょう。 ￼
+
+⸻
+
+確認②：docker-compose と docker compose の違い
+	•	コマンド名
+	•	docker-compose（ハイフン）＝ Compose v1
+	•	docker compose（スペース）＝ Compose v2（現行） ￼
+	•	実体/配布形態
+	•	v1：Python製の独立バイナリ
+	•	v2：Go製の Docker CLIプラグイン（cli-plugins 配下）
+（v2のインストール先・仕組みは公式ドキュメントに記載） ￼ ￼
+	•	サポート状況
+	•	v1：開発終了・EOL（2023年以降サポートなし）
+	•	v2：継続開発中（BuildKit等の改善も） ￼ ￼
+	•	Composeファイル
+	•	v2は Compose Specification に準拠。version: は省略可。
+	•	既存の docker-compose.yml も互換で読めますが、推奨は compose.yaml。 ￼
+
+⸻
+
+まとめ
+	•	共存は可能：docker-compose（v1）を残しつつ、docker compose（v2）をプラグインとして追加。
+	•	新システムは v2.18.1+ を要求：上の「手動配置」手順でバージョン固定OK。
+	•	衝突回避：-p または name: でプロジェクト名を明示すると安全。 ￼
+
+必要なら、あなたの環境（Ubuntuのバージョン/既存の導入経路）に合わせた最小変更の具体コマンドをこちらで組みます。
