@@ -1226,6 +1226,62 @@ NG が出る場合は、エディタの
 修正後に再アップ→Cloud storage の Manifests に manifest.jsonl を登録→タスク作成で manifest 行にチェック で進めば、先の IndexError / InvalidManifestError は出なくなります。
 
 
+---
+
+短答：はい。今の状態だと “動画として” 認識できていません。
+CVAT は manifest.jsonl の先頭3行（JSON Lines）が正しく読めたときだけ「video」と判定します。先に出ていた
+InvalidManifestError: 'name' is required は、ヘッダが読めず「images用」と解釈されたサインです。
+
+直し方（最短）
+	1.	最小マニフェストを作る（3行だけ・JSONL）
+
+cd /path/to/workdir
+cat > manifest.jsonl <<'EOF'
+{"version":"1.1"}
+{"type":"video"}
+{"properties":{"name":"20200426140719_0.mp4"}}
+EOF
+
+name は Cloud Storage の Prefix からの相対（あなたの例ならファイル名だけでOK）。
+文字コード UTF-8(BOMなし)、改行 LF。
+
+	2.	MinIOへ配置
+
+mc cp manifest.jsonl m/ai-pf/data/video_driving/00000001/
+mc ls m/ai-pf/data/video_driving/00000001/manifest.jsonl
+
+	3.	Cloud storages を保存
+
+	•	Endpoint: http://minio:9000
+	•	Bucket: ai-pf
+	•	Prefix: data/video_driving/00000001/
+	•	認証: Access key / Secret（admin / password 等）
+	•	Manifests に manifest.jsonl を Add manifest → Update
+
+	4.	タスク作成
+
+	•	Cloud Storage タブでストレージを選択
+	•	一覧で manifest.jsonl にチェック（このビルドは動画ファイルを選ぶと空扱いになることがある）
+	•	Continue → Submit
+
+うまくいかない時のチェック
+	•	JSONLの各行が完全なJSONか（簡易チェック）
+
+python3 - <<'PY'
+import json
+for i,l in enumerate(open('manifest.jsonl','r',encoding='utf-8'),1):
+    l=l.strip()
+    if not l: continue
+    json.loads(l)
+print("OK")
+PY
+
+	•	cvat_server / cvat_worker_import から MinIO へ疎通（どちらも 200 OK）
+
+docker compose exec cvat_server         curl -I http://minio:9000/minio/health/ready
+docker compose exec cvat_worker_import  curl -I http://minio:9000/minio/health/ready
+
+この最小3行が通れば、CVATは確実に「video」と認識します。必要なら、その後フレーム行を追加してもOKです。
 
 
 
