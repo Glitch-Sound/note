@@ -268,3 +268,129 @@ curl -I http://xxx:9000/minio/health/ready → 200 OK なら到達。  ￼
 
 
 
+
+
+
+
+
+---
+
+なるほど、:9000 に変えたら一覧は見えるようになったけど、タスク作成の途中で “Data processing failed / Could not create the task” ですね。
+この症状は、一覧（サーバー側のリスト取得）は通るのに、実データ取得→前処理（フレーム抽出）でワーカーがコケるときに出がちです。再現しやすい順に対処を並べます。
+
+⸻
+
+最優先で見るポイント（これで直ることが多い）
+
+1) Worker 側が MinIO へ到達できていない（Smokescreen/ネットワーク）
+
+CVAT は サーバ（cvat_server）とワーカー（cvat_worker）が別コンテナです。
+サーバでは MinIO に到達できるが、ワーカーからはブロック（プライベートレンジ拒否やプロキシ設定差分）で落ちると、0% のまま “Data processing failed” になります。
+
+対策
+	•	Smokescreen の許可レンジ（プライベートアドレス帯）を ワーカーにも適用する。.env か compose に以下を追加し、server と worker の両方に反映:
+
+SMOKESCREEN_OPTS=--allow-range=172.18.0.0/16
+
+※ 例は Docker ネットワークのレンジ。docker network inspect で実際の CIDR を確認して置き換え。
+
+	•	ついでに no_proxy に MinIO のホスト/ポートを入れて、直接到達させます（プロキシ経由にしない）:
+
+no_proxy=localhost,127.0.0.1,minio,xxx,xxx:9000
+
+
+	•	再起動後、両方のコンテナから疎通確認:
+
+docker compose exec cvat_server curl -s -I http://<minio-host>:9000/minio/health/ready
+docker compose exec cvat_worker curl -s -I http://<minio-host>:9000/minio/health/ready
+
+両方とも 200 OK なら OK。
+
+ありがち：server だけ許可して worker の許可を忘れる → 一覧は見えるが処理で失敗、という今の症状に一致します。
+
+⸻
+
+2) S3 権限が GET/HEAD で不足
+
+List は通るが Get で 403 になると同じエラーになります。
+MinIO 側の ユーザ/ポリシーに、対象バケットへ最低限これが必要です：
+	•	s3:ListBucket（バケット）
+	•	s3:GetObject と s3:HeadObject（オブジェクト）
+
+サンプル（バケット policy.json）
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::<BUCKET>"]},
+    {"Effect":"Allow","Action":["s3:GetObject","s3:HeadObject"],"Resource":["arn:aws:s3:::<BUCKET>/*"]}
+  ]
+}
+
+
+⸻
+
+3) manifest.jsonl を置く（動画は特に安定）
+
+クラウドストレージ上の 動画は、同じプレフィックスに manifest.jsonl を置くと、
+CVAT が動画のフレームインデックスを効率よく引けて 失敗が激減します。
+
+作り方（CVAT のユーティリティで）
+
+docker run --rm -u "$(id -u)":"(id -g)" -v "$PWD":/local \
+  --entrypoint python3 cvat/server \
+  utils/dataset_manifest/create.py --output-dir /local /local/video.mp4
+
+できた manifest.jsonl を MinIO の該当フォルダにアップし、Cloud Storage 設定で Use manifest を有効にしてパスを指定。
+
+⸻
+
+4) 動画コーデック非対応/壊れかけ
+
+ffmpeg が読めないコーデックや壊れかけの MP4/AVI だと 0% で落ちます。
+一度 H.264 + AAC に再エンコードして試すのが早いです。
+
+ffmpeg -i input.avi -c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k -movflags +faststart output.mp4
+
+
+⸻
+
+5) ディスク/一時領域不足
+
+フレーム抽出の一時ファイルは server/worker の共有ボリュームに書かれます。
+空きが少ないと処理が失敗。ホスト側の df -h と、CVAT ボリュームの空きを確認してください。
+
+⸻
+
+まずの切り分け（3分で分かる）
+	1.	ブラウザの開発者ツール → Network
+タスク作成時の POST /api/tasks と、その後の .../data リクエストのレスポンス本文を確認。
+403/5xx やエラーメッセージがそのまま出ていることがあります。
+	2.	サーバ/ワーカーのログを同時に確認
+
+docker compose logs -f cvat_server cvat_worker
+
+直近で ERROR, AccessDenied, SignatureDoesNotMatch, Deny: Private Range, ffmpeg などが出ていないか確認。
+
+	3.	worker から MinIO へ直接 GET できるか
+
+docker compose exec cvat_worker curl -I \
+  "http://<minio-host>:9000/<BUCKET>/<prefix>/video.mp4"
+
+403/Timeout なら #1 or #2 が濃厚。
+
+⸻
+
+設定の最終チェックリスト
+	•	CVAT Cloud Storage: Provider = AWS S3, Endpoint = http://xxx:9000（コンソール:9001や /minio は使わない）
+	•	server だけでなく worker も MinIO に到達可（Smokescreen 許可レンジ / no_proxy 設定）
+	•	MinIO のポリシーに List/Get/Head が含まれる
+	•	（動画）manifest.jsonl を置いて指定
+	•	（怪しい動画）H.264/AAC で再エンコードして再テスト
+	•	CVAT の作業ボリューム空き容量十分
+
+⸻
+
+もし .env / docker-compose.yml（server/worker の environment 周り）と、
+Cloud Storage 入力値（Endpoint, Bucket, Prefix, Use manifest 有無）を貼ってもらえれば、そのまま差し替えられる最小修正パッチを作って返します。ログ断片（数行）もあれば原因を特定しやすいです。
+
