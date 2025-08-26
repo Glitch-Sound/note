@@ -966,5 +966,54 @@ docker run --rm -u 0:0 \
 
 
 
+---
+
+了解。バックスラッシュ無し＆**権限でつまずかない（フルアクセス）**版を置きます。
+
+1) 作業ディレクトリへ移動してフルアクセス付与（乱暴ですが確実）
+
+cd /path/to/workdir
+sudo chmod -R 777 .
+
+2) manifest.jsonl を生成（単一ファイル）
+
+docker run --rm -u 0:0 -v "$PWD":/work -w /work cvat/server python3 -m cvat.utils.dataset_manifest.create --output-dir /work /work/your_video.avi --force
+
+成功すると ./manifest.jsonl ができます。
+
+3) MinIO にアップ（例）
+
+mc alias set m http://<minio-host>:9000 admin password
+mc cp manifest.jsonl m/<BUCKET>/<PREFIX>/
+
+	•	<PREFIX> は先頭スラッシュなし・バケット名は含めない・末尾 / 推奨（例：data/video_driving/00000001/）。
+
+⸻
+
+複数動画を一気に（拡張子混在OK）
+
+for f in *.avi *.mp4 *.mov *.mkv; do [ -f "$f" ] && docker run --rm -u 0:0 -v "$PWD":/work -w /work cvat/server python3 -m cvat.utils.dataset_manifest.create --output-dir /work "/work/$f" --force; done
+
+それぞれの動画と同じフォルダに都度 manifest.jsonl を上書き生成します（CVAT でそのフォルダの manifest を使えばOK）。
+
+⸻
+
+うまくいかない時の最終手
+
+CVAT コンテナ内で生成（マウント権限を完全回避）
+
+docker compose cp your_video.avi cvat_server:/tmp/your_video.avi
+docker compose exec cvat_server python3 -m cvat.utils.dataset_manifest.create --output-dir /tmp /tmp/your_video.avi --force
+docker compose cp cvat_server:/tmp/manifest.jsonl ./manifest.jsonl
+
+
+⸻
+
+CVAT 側の使い方（おさらい）
+	•	Cloud Storage 画面またはタスク作成の Cloud Storage タブで Use manifest を ON → manifest.jsonl を指定
+	•	これで Select data source が All しかなくても動画として認識され、あの IndexError: list index out of range を回避できます。
+
+必要なら、今の <BUCKET> と <PREFIX> を教えてくれれば、mc cp の行をコピペ済みの形に整えます。
+
 
 
