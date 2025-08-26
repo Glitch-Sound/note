@@ -1,0 +1,113 @@
+結論から：CVAT ⇔ MinIO を NGINX でリバースプロキシして連携することは可能です。
+ただし “S3 署名 (SigV4)” の都合で API をサブパス配下に置く構成（例：https://example.com/s3/…）は不可、専用のホスト名（サブドメイン）で丸ごとプロキシするのが鉄則です。MinIO 公式もその前提で設定例を出しています。 ￼
+
+以下、最小で動く構成と注意点をまとめます。
+
+⸻
+
+1) 推奨アーキテクチャ
+	•	https://s3.example.com → (NGINX でそのまま) → MinIO の S3 API (:9000)
+	•	https://console.example.com または https://s3.example.com/minio/ui → MinIO Console (:9001)
+※API は 専用ドメイン直下で受ける。サブパスは不可（署名が壊れます）。 ￼
+
+⸻
+
+2) NGINX（S3 API用）の基本設定例
+
+# s3.example.com 用（MinIO S3 API）
+server {
+  listen 443 ssl http2;
+  server_name s3.example.com;
+
+  # 大きなアップロードとストリーミングに配慮
+  client_max_body_size 0;
+  proxy_buffering off;
+  proxy_request_buffering off;
+  proxy_http_version 1.1;
+  proxy_read_timeout 600s;
+  proxy_send_timeout 600s;
+  ignore_invalid_headers off;   # 署名計算対象ヘッダを落とさない
+  # underscores_in_headers on;  # x-amz-meta-foo_bar など使う場合だけ
+
+  # SigV4 向けに Host を絶対に変えない（超重要）
+  location / {
+    proxy_set_header Host              $http_host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection        "";
+    chunked_transfer_encoding off;
+    proxy_pass http://minio:9000;
+  }
+
+  # （必要なら）CORS をプロキシ側で返す暫定対処
+  # add_header Access-Control-Allow-Origin https://cvat.example.com always;
+  # add_header Access-Control-Allow-Methods "GET,PUT,POST,DELETE,HEAD,OPTIONS" always;
+  # add_header Access-Control-Allow-Headers "Authorization,Content-Type,x-amz-acl,x-amz-date,x-amz-content-sha256,x-amz-security-token,x-amz-user-agent,x-amz-meta-*" always;
+  # if ($request_method = 'OPTIONS') { return 204; }
+}
+
+この形は MinIO 公式の NGINX 設定方針に沿っています（専用 DNS・Host ヘッダ温存・バッファ無効化など）。 ￼
+
+補足：SigV4 は Host やパスを 1 文字でも改変すると署名不一致になります。多くの “プロキシ越しで S3 署名が合わない問題” は Host / パス / ヘッダ書き換えが原因です。 ￼ ￼ ￼
+
+⸻
+
+3) MinIO 側のポイント（CORS と環境変数）
+	•	CORS は MinIO 側で全体設定するのが楽です（Community 版はバケット単位の PUT Bucket CORS が未対応。AIStor/商用のみ）。
+→ 例：MINIO_API_CORS_ALLOW_ORIGIN=https://cvat.example.com を MinIO 環境変数に設定。 ￼ ￼ ￼
+（どうしても触れない場合は、上の NGINX add_header でレスポンスに付与しても動きます）
+	•	MinIO の 公式 NGINX 手順をベースに（必要に応じて Console 用ロケーションも追加）。 ￼
+
+⸻
+
+4) CVAT 側の設定
+
+自前ホストの CVAT は S3 互換ストレージのカスタム Endpoint を指定可能です。
+（この “Endpoint URL を受け付ける” 仕様は CVAT の脆弱性アドバイザリにも明記） ￼
+
+UI から：
+	1.	「Cloud storages」→「＋」
+	2.	Provider: AWS S3
+	3.	Bucket name: your-bucket
+	4.	Authentication: Access key / Secret key（MinIOのAK/SK）
+	5.	Endpoint URL: https://s3.example.com（← NGINX の公開FQDN）
+	6.	Region: 任意（us-east-1 で可）
+	7.	Submit
+（CVAT のクラウドストレージ接続手順はこちら） ￼
+
+備考：endpoint_url を使う SDK（boto3）は 自動的に “パス形式 (path-style)” を使うため、ワイルドカードDNSの用意や MINIO_DOMAIN 設定は不要です。 ￼ ￼
+
+⸻
+
+5) ありがちなハマりどころ（チェックリスト）
+	•	サブパス配下に置いた → SignatureDoesNotMatch。専用ホスト直下に戻す。 ￼
+	•	Host ヘッダを upstream 名に変えている → 署名不一致。proxy_set_header Host $http_host; を厳守。 ￼
+	•	CORS エラー（ブラウザのコンソールに表示）
+	•	MinIO で MINIO_API_CORS_ALLOW_ORIGIN を設定（推奨）。 ￼ ￼
+	•	もしくは NGINX 側で Access-Control-* を付与。
+	•	413 (Request Entity Too Large) → client_max_body_size を十分大きく。 ￼
+	•	タイムアウト（大容量の multipart upload）→ proxy_read_timeout / proxy_send_timeout を延長、proxy_request_buffering off;。 ￼
+	•	時刻ずれ（署名の X-Amz-Date）→ サーバの NTP 同期を確認（数分のズレで失敗します）。
+	•	ブラウザからの直接アクセスを使うケースで プリサインURL を利用するなら、プロキシがヘッダを改変しないこと（Authorization/x-amz-* を温存）。 ￼
+
+⸻
+
+6) 動作確認コマンド（サーバ側）
+
+NGINX 経由で MinIO に届いているかを SDK/CLI で確認：
+
+# AWS CLI を MinIO に向ける例
+aws --endpoint-url https://s3.example.com s3 ls \
+  --no-verify-ssl  #（自己署名なら一時的に）
+
+SignatureDoesNotMatch が出たら、まず Host ヘッダとサブパス禁止を疑ってください。 ￼
+
+⸻
+
+まとめ（設計の勘所）
+	•	可能：CVAT⇔MinIO を NGINX 逆プロキシで問題なく運用できる。
+	•	必須条件：専用サブドメイン直下で API をプロキシ／Host を保持／CORS 設定。 ￼ ￼
+	•	CVAT 側：Cloud Storage に Endpoint URL と AK/SK を設定すれば OK。 ￼ ￼
+
+必要なら、あなたのドメイン名・既存 compose/helm 構成に合わせた 具体的な NGINX サーバーブロック／docker-compose の env 設定まで落とし込みます。どの形で運用中か（ホスト名、TLS 終端の場所、CVAT/MinIO のバージョン）だけ教えてください。
