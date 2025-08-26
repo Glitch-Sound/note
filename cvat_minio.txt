@@ -626,3 +626,101 @@ UI からの一覧表示や取り込み処理も OK。
 
 
 
+
+
+
+---
+
+はい、同一の Docker ブリッジネットワークに入れれば OK です。
+その場合、CVAT の Cloud Storage の Endpoint URL は http://minio:9000（= サービス名 + ポート）にできます。外向けに 9000 を開ける必要はありません。
+
+⸻
+
+やること（最短）
+	1.	同一ネットワークに載せる
+
+networks:
+  cvat_net:
+    driver: bridge
+    # （任意）固定サブネットにしておくと後の許可レンジ指定が楽
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    # API 9000 は公開しない（ブラウザから触らせない）
+    # ports: [ "9001:9001" ]  # ← コンソールを見たいならだけ公開
+    networks:
+      cvat_net:
+        aliases: [minio, s3]   # ← CVAT から http://minio:9000 で到達させる
+
+  cvat_server:
+    image: cvat/server
+    environment:
+      # ← CVAT がプライベートレンジをブロックしないように許可
+      SMOKESCREEN_OPTS: --allow-range=172.30.0.0/24
+      no_proxy: "localhost,127.0.0.1,minio,s3"
+    networks: [cvat_net]
+
+  cvat_worker:
+    image: cvat/worker
+    environment:
+      SMOKESCREEN_OPTS: --allow-range=172.30.0.0/24
+      no_proxy: "localhost,127.0.0.1,minio,s3"
+    networks: [cvat_net]
+
+  # CVAT UI/Proxy などは既存のまま（外向けは 80/8080 のみ公開）
+
+既存ネットワークを使うなら
+docker network inspect <net名> で Subnet を見て、その CIDR を SMOKESCREEN_OPTS に入れてください。
+
+	2.	CVAT の Cloud Storage を作成
+
+	•	Provider: AWS S3
+	•	Endpoint URL: http://minio:9000（サブパス不可）
+	•	Access key / Secret key: MinIO の鍵（例: admin / password）
+	•	Bucket / Prefix: 例 mybucket / datasets/projectA/（先頭/なし・末尾/推奨）
+	•	Use path-style addressing = ON（MinIO はこれが安定）
+	•	まずは Read-only = ON で登録が通るか確認
+
+	3.	疎通チェック（両方のコンテナから）
+
+docker compose exec cvat_server curl -s -I http://minio:9000/minio/health/ready
+docker compose exec cvat_worker curl -s -I http://minio:9000/minio/health/ready
+# どちらも 200 OK になること
+
+	4.	タスク作成（動画）
+
+	•	Cloud Storage タブで今作ったストレージを選ぶ
+	•	Select data source = Videos に変更（超重要）
+	•	必要なら Include subdirectories を ON
+	•	（推奨）同階層に manifest.jsonl を置き Use manifest を ON
+
+⸻
+
+複数ユーザが別マシンから編集できるか？
+
+できます。
+MinIO API は Docker 内部ネットワーク専用、ブラウザは CVAT（80/8080）だけを見ます。
+CVAT が MinIO から動画を取り込んでフレームを自前配信するため、ユーザ側が MinIO に直接届く必要はありません（= 社外公開不要）。
+※ 例外的に署名 URL を返す機能を使う場合は CORS/到達性が必要ですが、通常のタスク作成→アノテーション運用では不要です。
+
+⸻
+
+つまずきがちな点（チェック）
+	•	Endpoint URL = http://minio:9000（サブパスや 9001 は 不可）
+	•	Use path-style = ON
+	•	SMOKESCREEN_OPTS を server と worker の両方に設定（許可レンジは実サブネットに合わせる）
+	•	no_proxy に minio を入れる
+	•	MinIO 側ポリシーに ListBucket / GetObject / HeadObject（書き込みも要るなら Put/Delete も）
+
+この形にすれば、外向けは 80/8080 だけのまま、CVAT⇔MinIO は内部ネットワークで安全・確実に連携できます。
+
+
+
