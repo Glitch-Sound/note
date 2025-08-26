@@ -1,0 +1,129 @@
+了解！Python から FFmpeg を使うなら、用途別に次の2択が鉄板です。結論だけ先に：
+	•	本番・再現性重視（サーバ／WSL2／CI） → Dockerで OS パッケージの FFmpeg を入れる（推奨）
+	•	手早くクロスプラットフォームに動かしたい → requirements.txt に imageio-ffmpeg を入れる（FFmpeg 本体同梱）  ￼ ￼
+
+⸻
+
+1) Dockerで入れる（最も再現性が高い）
+
+Debian/Ubuntu 系（軽量・無難）
+
+# ベースは好みでpython:3.x-slim等
+FROM python:3.11-slim
+
+# ffmpeg を OS パッケージで導入（ffprobe も同梱）
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+# Python ライブラリ（必要に応じて）
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+WORKDIR /app
+COPY . .
+CMD ["python", "main.py"]
+
+apt-get install ffmpeg で CLI の ffmpeg と ffprobe が入り、PATH が通ります。  ￼
+
+Alpine 系（さらに軽量）
+
+FROM python:3.11-alpine
+RUN apk add --no-cache ffmpeg
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
+COPY . .
+CMD ["python", "main.py"]
+
+もし 特定の新しめの FFmpeg 機能（例: v6+ のフィルタ）を確実に使いたい場合、ディストリの標準版が古いことがあります。その場合は Docker 内で静的ビルドを取得 するか、外部リポジトリ／自前ビルドに切り替える運用も検討してください。  ￼
+
+⸻
+
+2) requirements.txt だけで完結させる（FFmpeg 同梱）
+
+imageio-ffmpeg は プラットフォーム別ホイールに FFmpeg 実行ファイルを同梱しています（約60MB）。Python 側から get_ffmpeg_exe() で実体パスが取れるので、そのまま subprocess や他ライブラリから使えます。
+requirements.txt 例：
+
+imageio-ffmpeg>=0.4
+ffmpeg-python>=0.2   # （任意）流れるようなAPIでコマンドを組み立てたい場合
+
+	•	imageio-ffmpeg：FFmpeg バイナリを提供し、IMAGEIO_FFMPEG_EXE 環境変数や同梱・conda・システムの順で検出します。  ￼ ￼ ￼
+	•	ffmpeg-python：CLI のラッパー（FFmpeg 本体は別途必要）。上の imageio-ffmpeg と併用すると楽です。  ￼ ￼
+	•	（代替）PyAV：FFmpeg ライブラリに直接バインディング。最近は FFmpeg にリンク済みのバイナリホイールが配布されます（機能豊富な代わりにサイズ大きめ/ビルド相性に注意）。  ￼
+
+⸻
+
+3) 具体的な使い方サンプル
+
+A. imageio-ffmpeg + subprocess（一番シンプル）
+
+from pathlib import Path
+import subprocess
+import imageio_ffmpeg as iio
+
+ffmpeg = iio.get_ffmpeg_exe()  # 同梱 or 環境変数 or システムから自動検出
+inp = Path("input.avi")
+out = Path("output.mp4")
+
+cmd = [
+    ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+    "-i", str(inp),
+    "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+    "-c:a", "aac", "-b:a", "192k",
+    str(out),
+]
+subprocess.run(cmd, check=True)
+
+IMAGEIO_FFMPEG_EXE を設定すれば使用する FFmpeg を固定できます。  ￼
+
+B. ffmpeg-python（Python っぽくフィルタを組み立て）
+
+import ffmpeg
+import imageio_ffmpeg as iio
+import os
+
+# ffmpeg-python は既定で "ffmpeg" を呼ぶので、PATHを通すか以下のように上書き
+os.environ["PATH"] = f"{os.pathsep}{os.path.dirname(iio.get_ffmpeg_exe())}{os.pathsep}{os.environ.get('PATH','')}"
+
+(
+    ffmpeg
+    .input("input.avi")
+    .output("output.mp4", vcodec="libx264", crf=23, preset="veryfast", acodec="aac", audio_bitrate="192k")
+    .overwrite_output()
+    .run(quiet=True)
+)
+
+ffmpeg-python 自体は FFmpeg 本体を同梱しないため、上のように PATH にバイナリを見せるのが楽です。  ￼
+
+C. PyAV（ライブラリ直叩き）
+
+# requirements.txt に
+av>=11
+
+import av
+with av.open("input.mp4") as container:
+    for frame in container.decode(video=0):
+        img = frame.to_image()
+        # 画像処理...
+
+PyPI の av は FFmpeg にリンク済みのホイールが提供されています（環境によりサイズ大きめ）。  ￼
+
+⸻
+
+4) どっちが最適？
+	•	長期運用・誰の環境でも同じ結果にしたい → Docker
+	•	OS パッケージで ffmpeg/ffprobe が確実に入り、PATH も統一。CI/CD で再現性◎。  ￼
+	•	配布が pip 中心／なるべくセットアップを簡単に → imageio-ffmpeg
+	•	プロジェクトだけで完結しやすい（FFmpeg 同梱）。サイズは ~60MB 増えるが扱いが楽。  ￼
+	•	細かいフレーム操作や低レベル制御 → PyAV も候補。  ￼
+
+⸻
+
+5) ハマりどころ（回避策）
+	•	pip の ffmpeg という別パッケージは本体ではなく別物です。本体は OS/同梱で用意し、Python 側はラッパーを使う、が基本。 ￼
+	•	H.264 などのコーデック可否はパッケージ源に依存（Anaconda の defaults ffmpeg では H.264 非対応など）。必要なら conda-forge 版や OS パッケージ、静的ビルドを選択。  ￼
+
+⸻
+
+必要なら、あなたの環境（WSL2/Docker Compose 構成や GPU 有無、使いたいコーデック）に合わせて 最小サイズの Dockerfile や 社内リポジトリ向け requirements.txt を作って渡します。どちらで進めるかだけ教えてくれれば、その前提で即仕上げます！
