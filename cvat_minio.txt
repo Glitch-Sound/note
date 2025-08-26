@@ -195,3 +195,76 @@ server {
 ⸻
 
 必要なら、あなたの現在の nginx 設定（server/location 部分）と CVAT の Cloud Storage 入力値（Endpoint、Bucket など）を書いてくれれば、そのまま差し替え可能な最小変更パッチにして返します。
+
+
+
+
+---
+
+
+できます。手動アップロードは通るのに MinIO 経由だと失敗する場合、だいたい次のどれかが原因です。サッとチェックしてみてください。
+
+1) “正しい”エンドポイントを使う
+	•	CVAT の「Cloud storages」で Provider: AWS S3 を選び、Endpoint URL は MinIO の S3 API ポート（通常 :9000） を指定します。:9001 はコンソール用なので不可、また /minio のようなサブパス配下をエンドポイントにするのも不可です。MinIO は S3 API=:9000 / Console=:9001 というポート構成です。  ￼
+	•	CVAT は S3 互換ストレージ向けに カスタム Endpoint URL を受け付けます（＝MinIO を直接指定できる）。  ￼
+	•	CVAT の入力欄はだいたい以下：Bucket name / Access key / Secret key / (Region 任意) / Prefix 任意 / Endpoint URL（例：http://xxx:9000）。手順は公式の「Attach cloud storage」を参照。  ￼
+
+2) ブラウザからの取得用に CORS を入れる
+
+CVAT はクラウドストレージのオブジェクトにブラウザから署名 URL で直接アクセスする場合があるため、MinIO のバケットに CORS を設定しておきます（少なくとも GET/HEAD、輸出もするなら PUT など）。
+例（cors.json）:
+
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["http://xxx:8080"],
+      "AllowedMethods": ["GET","HEAD","PUT"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag","x-amz-request-id"],
+      "MaxAgeSeconds": 3000
+    }
+  ]
+}
+
+適用コマンド例：
+	•	AWS CLI: aws s3api put-bucket-cors --bucket <BUCKET> --cors-configuration file://cors.json  ￼
+	•	MinIO Client(mc): mc cors set-json myminio/<BUCKET> cors.json  ￼
+
+3) 動画は manifest.jsonl を用意すると安定する
+
+クラウドストレージ上の 動画をタスクにする時は manifest.jsonl を併置すると作成が安定・高速化します。CVAT 公式の生成ツールを使うと簡単です（Docker で実行可能）。
+例：
+
+docker run --rm -u "$(id -u)":"$(id -g)" -v "$PWD":/local \
+  --entrypoint python3 cvat/server \
+  utils/dataset_manifest/create.py --output-dir /local /local/video.mp4
+
+※キーフレームが少ない動画は --force を付けると作れます。できた manifest.jsonl を 同じプレフィックスにアップして、Cloud Storage の設定でそのファイル名を登録してください。  ￼
+CVAT の動画対応は ffmpeg が読める一般的な形式（MP4/AVI/MOV など）が対象です。  ￼
+
+4) ローカル/プライベート IP を CVAT がブロックしているケース
+
+CVAT は内部で Smokescreen によりプライベートアドレス宛の外向き通信をデフォルト拒否します。MinIO が同一ネットワーク上（例：172.18.0.0/16）だと “Deny: Private Range” で弾かれることがあります。
+.env に例のように許可レンジを足すと解消します（自己責任で最小範囲の許可にしてください）：
+
+SMOKESCREEN_OPTS=--allow-range=172.18.0.0/16
+
+この事象と回避はコミュニティにもまとまっています。  ￼
+
+5) クイック診断
+	•	CVAT サーバーから MinIO に届くか：
+curl -I http://xxx:9000/minio/health/ready → 200 OK なら到達。  ￼
+	•	Cloud Storage 画面でバケットやプレフィックスが見えない → 認証情報/バケット権限、Endpoint URL（9000になっているか）と CORS を再確認。手順は CVAT ドキュメント通りでOK。  ￼
+
+⸻
+
+まとめ（チェックリスト）
+	•	CVAT 側 Provider=AWS S3 / Endpoint=http://xxx:9000（コンソール:9001 や /minio サブパスは使わない）  ￼
+	•	MinIO バケットに CORS（少なくとも GET/HEAD） を設定  ￼
+	•	動画には manifest.jsonl を置いて Cloud Storage 設定で指定（--force が効く場合あり）  ￼
+	•	MinIO がプライベート IP の場合は SMOKESCREEN_OPTS で許可レンジ追加  ￼
+
+これで MinIO に置いた動画を CVAT から参照してアノテーションできるはずです。うまくいかなければ、どこでエラーになるか（Cloud Storage 追加時か、タスク作成時か、フレームの表示時か）を教えてください。ログの読み方も含めて切り分けます。
+
+
+
