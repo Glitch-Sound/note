@@ -1072,3 +1072,61 @@ UI が All files しか出なくても、これで動画として確実に取り
 
 
 
+
+
+
+
+
+---
+
+それは **「クラウドストレージのプレビュー画像を生成できなかった」**というだけの通知です（/api/cloudstorages/9/preview が 500）。致命的ではありませんが、設定ミスか到達性/認可ミスがあるサインです。下の順で直せます。
+
+直す順番（最短ルート）
+	1.	認証を匿名にしない
+いま画面は Anonymous access になっていました。MinIO のバケット/オブジェクトが PUBLIC でない限り失敗します。
+→ Authorization type = Access key and secret key に変更して
+Access key ID=admin / Secret access key=password を入力し直して Update。
+	2.	manifest の指定を確実に保存
+Cloud storages → mini を Edit
+	•	Bucket: ai-pf
+	•	Prefix: data/video_driving/00000001/（先頭/なし・末尾/）
+	•	Manifests: manifest.jsonl を入力して 必ず「Add manifest」を押す → 追加済み（タグ表示）を確認 → Update
+（保存できない場合はフルパス data/video_driving/00000001/manifest.jsonl で追加）
+	3.	CVAT→MinIO の到達性（server と worker 両方）
+
+docker compose exec cvat_server         curl -I http://minio:9000/minio/health/ready
+docker compose exec cvat_worker_import  curl -I http://minio:9000/minio/health/ready
+
+両方 200 OK になること。ならない場合は SMOKESCREEN_OPTS と no_proxy を server/worker 両方に設定して再起動：
+
+SMOKESCREEN_OPTS=--allow-range=<DockerネットワークCIDR>   # 例: 172.30.0.0/24
+no_proxy=localhost,127.0.0.1,minio,s3
+
+
+	4.	MinIO 上に本当にあるか
+
+mc ls minio/ai-pf/data/video_driving/00000001/manifest.jsonl
+
+出なければ置き場所 or 拡張子（.json ではなく .jsonl）を見直し。
+
+⸻
+
+その上での使い方
+	•	Create a new task → Cloud Storage タブ
+	•	Select cloud storage で mini を選択（Select data source は All のままでOK）
+	•	Files 一覧で目的の .mp4 / .avi にチェック → 右上の Selected: 1 以上 を確認 → Continue → Submit
+
+※ Selected が 0 のまま進めると、以前と同じ IndexError: list index out of range になります。
+プレビュー取得に失敗していても、一覧で選べて Selected>0 ならタスク作成自体は可能です。
+
+⸻
+
+まだ同じ通知が出る場合
+	•	docker compose logs -f cvat_server を出しながら再現し、直後のエラーメッセージ（AccessDenied / SignatureDoesNotMatch / Name or service not known など）を数行貼ってください。
+それに合わせてピンポイントで修正箇所（認可/経路/パス）を示します。
+
+
+
+
+
+
