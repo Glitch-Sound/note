@@ -1130,3 +1130,102 @@ mc ls minio/ai-pf/data/video_driving/00000001/manifest.jsonl
 
 
 
+
+
+
+
+
+---
+
+結論：今の manifest は JSONL として“形が合っていません”。
+JSONL は「1行=1つの完全な JSON オブジェクト」ですが、あなたのファイルは
+	•	先頭3行は OK に見える一方、
+	•	その後のフレーム行が {} に包まれていない ＆ name が無い
+
+ため、CVAT が InvalidManifestError: 'name' is required を返しています。
+（公式サンプルは各行すべて { ... } です）
+
+⸻
+
+これなら通ります（最小の manifest：動画1本）
+
+まずは この3行だけの JSONL を試してください（1行=1 JSON）。
+
+{"version":"1.1"}
+{"type":"video"}
+{"properties":{"name":"20200426140719_0.mp4"}}
+
+	•	name は Prefix からの相対パス（あなたの例ならファイル名だけでOK）。
+	•	文字コードは UTF-8（BOMなし）、改行は LF。
+
+これを manifest.jsonl として MinIO の
+ai-pf/data/video_driving/00000001/ に置き、Cloud storage の Manifests に manifest.jsonl を登録。
+タスク作成では manifest.jsonl の行にチェック → Continue で通るはずです。
+
+⸻
+
+フレーム行も入れたい場合（正しい形）
+
+{"version":"1.1"}
+{"type":"video"}
+{"properties":{"name":"20200426140719_0.mp4","resolution":[1920,1080],"length":858}}
+{"number":0,"pts":0,"checksum":"0464f...","name":"20200426140719_0.mp4"}
+{"number":75,"pts":38400,"checksum":"81eca...","name":"20200426140719_0.mp4"}
+...（以降すべての行で {…,"name":"20200426140719_0.mp4"}）
+
+各行が {} を含む完全な JSON であることが必須です。
+フレーム行にも必ず "name" を入れてください。
+
+⸻
+
+失敗しない作り方（どちらか）
+
+A) CVAT 公式の生成ツールで作る（推奨）
+
+cd /path/to/workdir   # 動画を置いたディレクトリ
+sudo docker run --rm -u 0:0 -v "$PWD":/work -w /work \
+  --entrypoint python3 cvat/server \
+  -m cvat.utils.dataset_manifest.create \
+  --output-dir /work /work/20200426140719_0.mp4 --force
+
+→ 正しい manifest.jsonl ができます。
+
+B) 最小3行を自分で作る
+
+cat > manifest.jsonl <<'EOF'
+{"version":"1.1"}
+{"type":"video"}
+{"properties":{"name":"20200426140719_0.mp4"}}
+EOF
+
+
+⸻
+
+うまく保存できているか（簡易バリデータ）
+
+python3 - <<'PY'
+import json
+ok=True
+for i,l in enumerate(open('manifest.jsonl','r',encoding='utf-8'),1):
+    s=l.strip()
+    if not s: continue
+    try: json.loads(s)
+    except Exception as e:
+        print('NG line', i, ':', e); ok=False; break
+print('OK: all lines are valid JSON' if ok else 'Invalid JSONL')
+PY
+
+NG が出る場合は、エディタの
+	•	引用符が全角になっていないか（“ ” は不可、” “ を使用）
+	•	BOM 付きや CRLF で保存していないか
+を直してください（dos2unix manifest.jsonl などで LF に変換可）。
+
+⸻
+
+これで 「JSONL だが読めない」状態は解消できます。
+修正後に再アップ→Cloud storage の Manifests に manifest.jsonl を登録→タスク作成で manifest 行にチェック で進めば、先の IndexError / InvalidManifestError は出なくなります。
+
+
+
+
+
