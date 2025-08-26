@@ -122,8 +122,172 @@ PyPI の av は FFmpeg にリンク済みのホイールが提供されていま
 
 5) ハマりどころ（回避策）
 	•	pip の ffmpeg という別パッケージは本体ではなく別物です。本体は OS/同梱で用意し、Python 側はラッパーを使う、が基本。 ￼
-	•	H.264 などのコーデック可否はパッケージ源に依存（Anaconda の defaults ffmpeg では H.264 非対応など）。必要なら conda-forge 版や OS パッケージ、静的ビルドを選択。  ￼
+	•	H.264 などのコーデック可否はパッケージ源に依存（Anaconda の defaults ffmpeg では H.264 非対応など）。必要なら conda-forge 版や OS パッケージ、静的ビルドを
+ Dockerfile や 社内リポジトリ向け requirements.txt を作って渡します。どちらで進めるかだけ教えてくれれば、その前提で即仕上げます！
 
-⸻
 
-必要なら、あなたの環境（WSL2/Docker Compose 構成や GPU 有無、使いたいコーデック）に合わせて 最小サイズの Dockerfile や 社内リポジトリ向け requirements.txt を作って渡します。どちらで進めるかだけ教えてくれれば、その前提で即仕上げます！
+---
+
+
+
+了解！requirements.txt で必要ライブラリを入れて、Python から AVI → MP4 (H.264 + AAC) に変換する最小セットを用意しました。
+※ ffmpeg の“本体”は OS に入っていないと動かないことが多いですが、ここでは imageio-ffmpeg が同梱する ffmpeg 実行ファイル を使うので、追加インストールなしで動きます 👍
+
+1) requirements.txt
+
+ffmpeg-python>=0.2.0
+imageio-ffmpeg>=0.4.9
+tqdm>=4.66
+
+2) 変換スクリプト（単発/一括どちらも対応）
+
+convert_avi_to_mp4.py
+
+import argparse
+import pathlib
+from tqdm import tqdm
+import ffmpeg
+import imageio_ffmpeg
+
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
+def convert_one(in_path: pathlib.Path, out_path: pathlib.Path, crf: int, preset: str, nvenc: bool, overwrite: bool):
+    vcodec = "h264_nvenc" if nvenc else "libx264"  # NVIDIA GPUがあれば --nvenc で高速化
+    stream = (
+        ffmpeg
+        .input(str(in_path))
+        .output(
+            str(out_path),
+            vcodec=vcodec,
+            pix_fmt="yuv420p",    # ブラウザ再生互換
+            crf=crf,              # 品質(数値↓=高品質/大容量) 目安: 18-28
+            preset=preset,        # エンコード速度(速いほど画質コスパ低下)
+            acodec="aac",
+            audio_bitrate="192k",
+            movflags="+faststart" # Web配信向け
+        )
+    )
+
+    try:
+        ffmpeg.run(
+            stream,
+            cmd=FFMPEG_EXE,
+            overwrite_output=overwrite,
+            capture_stdout=True,
+            capture_stderr=True
+        )
+    except ffmpeg.Error as e:
+        raise RuntimeError(e.stderr.decode("utf-8", errors="ignore"))
+
+def main():
+    p = argparse.ArgumentParser(description="Convert AVI to MP4 (H.264 + AAC)")
+    p.add_argument("src", help="入力: AVIファイル または ディレクトリ")
+    p.add_argument("-o", "--out", help="出力ファイル/ディレクトリ（省略時は同階層に .mp4 を生成）")
+    p.add_argument("--crf", type=int, default=23, help="画質CRF(18-28推奨, 小さいほど高品質/大容量)")
+    p.add_argument("--preset", default="medium", help="x264/nvenc preset (ultrafast..placebo / default=medium)")
+    p.add_argument("--nvenc", action="store_true", help="NVIDIA GPUでエンコード(h264_nvenc)を使用")
+    p.add_argument("--overwrite", action="store_true", help="既存の出力を上書き")
+    p.add_argument("--recursive", action="store_true", help="ディレクトリ入力時に再帰探索")
+    args = p.parse_args()
+
+    src_path = pathlib.Path(args.src)
+    if not src_path.exists():
+        raise FileNotFoundError(f"入力が見つかりません: {src_path}")
+
+    # 単発ファイル
+    if src_path.is_file():
+        if args.out:
+            out_path = pathlib.Path(args.out)
+            if out_path.is_dir():
+                out_path = out_path / (src_path.stem + ".mp4")
+        else:
+            out_path = src_path.with_suffix(".mp4")
+
+        convert_one(src_path, out_path, args.crf, args.preset, args.nvenc, args.overwrite)
+        print(f"OK: {src_path.name} -> {out_path}")
+
+    # ディレクトリ一括
+    else:
+        if args.recursive:
+            avi_list = list(src_path.rglob("*.avi"))
+        else:
+            avi_list = list(src_path.glob("*.avi"))
+
+        if not avi_list:
+            print("AVIファイルが見つかりませんでした。")
+            return
+
+        if args.out:
+            out_dir = pathlib.Path(args.out)
+            out_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir = None
+
+        for in_f in tqdm(avi_list, desc="Converting"):
+            if out_dir:
+                rel = in_f.relative_to(src_path) if args.recursive else in_f.name
+                rel_path = rel if isinstance(rel, pathlib.Path) else pathlib.Path(rel)
+                out_path = (out_dir / rel_path).with_suffix(".mp4")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                out_path = in_f.with_suffix(".mp4")
+
+            if out_path.exists() and not args.overwrite:
+                # スキップ
+                continue
+
+            try:
+                convert_one(in_f, out_path, args.crf, args.preset, args.nvenc, args.overwrite)
+            except Exception as e:
+                print(f"NG: {in_f} -> {e}")
+
+        print("完了")
+
+if __name__ == "__main__":
+    main()
+
+3) 使い方
+
+# 仮想環境は任意
+python -m venv .venv
+./.venv/Scripts/activate  # Windows
+# source .venv/bin/activate  # macOS/Linux
+
+pip install -r requirements.txt
+
+# 単発変換
+python convert_avi_to_mp4.py path/to/input.avi
+
+# 出力先を指定
+python convert_avi_to_mp4.py path/to/input.avi -o path/to/output.mp4
+
+# ディレクトリ内の .avi を一括変換（同じ階層に .mp4 を作成）
+python convert_avi_to_mp4.py path/to/dir
+
+# 出力先ディレクトリをまとめたい場合
+python convert_avi_to_mp4.py path/to/dir -o out_dir
+
+# 再帰的にサブフォルダも処理
+python convert_avi_to_mp4.py path/to/dir --recursive
+
+# 品質/速度の調整（例: 高品質/やや遅い）
+python convert_avi_to_mp4.py input.avi --crf 20 --preset slow
+
+# 既存ファイルを上書き
+python convert_avi_to_mp4.py input.avi --overwrite
+
+# NVIDIA GPU で高速エンコード（対応環境のみ）
+python convert_avi_to_mp4.py input.avi --nvenc
+
+パラメータの目安
+	•	--crf: 18（高品質・大きい）～ 28（低品質・小さい）。デフォルト 23。まずは 20–24 で調整。
+	•	--preset: faster にするほどエンコードは速くなるが圧縮効率は落ちる。medium で困らなければそのまま。
+	•	--nvenc: 対応 GPU があればかなり速くなります（ファイルサイズはやや大きくなりがち）。
+
+補足
+	•	ブラウザ/HTML5 <video> での再生互換のため、H.264 + AAC / yuv420p にしています。
+	•	変換に失敗する AVI（壊れかけ・古いコーデック）に遭遇したら、まず単発で実行して標準エラーの内容を見てください。必要に応じて -an（音声なし）や -sn（字幕なし）を ffmpeg_params に追加する手もあります。
+
+必要なら Docker 版（イメージに ffmpeg を同梱）も出せますが、まずはこの requirements.txt 方式でサクッと回るはず。欲しい拡張（ロスレス、解像度変更、フレームレート変更、音声のみ抽出など）があれば言ってください。
+
+
