@@ -790,3 +790,90 @@ docker compose ps で サービス名 を確認して実行してください。
 
 
 
+
+
+
+
+
+
+
+---
+
+結論から：
+	•	AVIだから失敗…ではありません（ffmpeg が読める AVI なら OK）。
+	•	「Select data source に All しかない」UI でも取り込めます。
+→ このタイプの UI では 「Filename pattern」(ファイル名パターン) で種類を絞ります。
+	•	どうしても不安定なら manifest.jsonl を置けば確実に通ります。
+
+⸻
+
+まずは UI だけで通す（Allしか出ない版のCVAT想定）
+	1.	Cloud Storage を選択（Endpointは http://minio:9000 / path-style=ON）
+	2.	Filename pattern に動画だけを許可する正規表現を入れる
+	•	例：(?i).*\\.(avi|mp4|mov|mkv)$
+※ (?i) は大文字小文字無視。Windows のブラウザでも拡張子大小混在を拾えます。
+	3.	Include subdirectories（サブフォルダにある場合はON）
+	4.	リストで目的の動画にチェック → 右上の Selected: N が 1以上 になっていることを必ず確認
+	5.	Continue → Submit
+
+ここで Selected が 0 のままだと、ワーカー側で sources[0] を踏んで
+IndexError: list index out of range（あなたのログ）になります。
+まず Selected: N > 0 を満たしてから Continue してください。
+
+⸻
+
+まだ落ちる/不安定な場合は manifest.jsonl を使う（動画では特に効く）
+	1.	いったん動画を手元へ取得（例：MinIOのmc）
+
+mc alias set m http://<minio-host>:9000 admin password
+mc cp m/<BUCKET>/<PREFIX>/your_video.avi .
+
+	2.	manifest を生成
+
+docker run --rm -u "$(id -u)":"$(id -g)" -v "$PWD":/local \
+  --entrypoint python3 cvat/server \
+  utils/dataset_manifest/create.py --output-dir /local /local/your_video.avi --force
+
+→ カレントに manifest.jsonl ができます。
+	3.	manifest を同じ Prefix にアップ
+
+mc cp manifest.jsonl m/<BUCKET>/<PREFIX>/
+
+	4.	CVAT 側
+	•	Cloud Storage（そのバケット/Prefix）を使い、Use manifest を ON
+	•	パスに manifest.jsonl を指定（相対でOK）
+	•	この場合は Filename pattern を空にして進めるのが安定
+
+manifest を使うと、CVAT は動画の実体を manifest 経由で確実に認識するため、
+UIのデータ種別が All でも問題になりません。
+
+⸻
+
+それでも失敗するときの最終チェック
+	•	Prefix の書き方：先頭 / なし、バケット名を含めない、末尾 / 推奨（例：datasets/project0826/）
+	•	cvat_worker_import から MinIO に疎通できるか
+
+docker compose exec cvat_worker_import curl -I http://minio:9000/minio/health/ready
+
+200 OK にならない場合：
+	•	SMOKESCREEN_OPTS=--allow-range=<DockerネットワークCIDR> を server と import worker 両方に設定
+	•	no_proxy=localhost,127.0.0.1,minio,s3 を両方に設定
+
+	•	MinIO の権限：少なくとも s3:ListBucket, s3:GetObject, s3:HeadObject
+	•	コーデック問題の切り分け：一度 MP4(H.264/AAC) に再エンコードして試す
+
+ffmpeg -i input.avi -c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k -movflags +faststart output.mp4
+
+
+
+⸻
+
+まとめ
+	•	All しか出ないUI → Filename pattern で動画拡張子を指定し、Selected: N>0 を確認してから実行。
+	•	確実に通したい → manifest.jsonl を同階層に置いて Use manifest。
+	•	それでもNGなら、worker疎通/権限/コーデックの順で切り分け。
+
+必要なら、今の Bucket / Prefix /（あれば）pattern / Use manifest の有無 を書いてくれれば、あなたの環境に合わせた入力値そのままコピペ版を作るよ。
+
+
+
