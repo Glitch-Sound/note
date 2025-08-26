@@ -1,0 +1,167 @@
+いいね、それなら「metrics 配列」をそのまま受け取って 4 本の折れ線を描く Vue3 + ECharts の最小実装を用意したよ。step を横軸、value を縦軸にして、train_acc / train_loss / val_acc / val_loss をそれぞれ 1 系列として表示。配列が更新されればグラフも自動更新されます。
+
+1) 型とデータ前提
+
+// types.ts
+export type MetricKey = 'train_acc' | 'train_loss' | 'val_acc' | 'val_loss';
+
+export interface Metric {
+  key: MetricKey;   // 上記4種類のみ
+  value: number;    // 指標値
+  step: number;     // 0,1,2,... と増える
+}
+
+2) 再利用できるグラフコンポーネント
+
+ECharts を直 import（ラッパー不要）でシンプルにしています。
+
+<!-- components/MetricsLineChart.vue -->
+<template>
+  <div ref="chartEl" style="width:100%; height:360px;"></div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue';
+import * as echarts from 'echarts';
+import type { Metric, MetricKey } from '@/types';
+
+const props = defineProps<{
+  metrics: Metric[];   // 親から渡すリアクティブ配列
+}>();
+
+const KEYS: MetricKey[] = ['train_acc', 'train_loss', 'val_acc', 'val_loss'];
+
+const chartEl = ref<HTMLDivElement | null>(null);
+let chart: echarts.ECharts | null = null;
+
+/**
+ * metrics（縦長：key/value/step）→ ECharts dataset（横持ち：1行=1step）へ変換
+ * 例）{step:0, train_acc:..., train_loss:..., val_acc:..., val_loss:...}
+ * 欠損は null にして折れ線は繋げない(connectNulls: false)。
+ */
+const datasetSource = computed(() => {
+  const byKey = new Map<MetricKey, Map<number, number>>();
+  KEYS.forEach(k => byKey.set(k, new Map()));
+  for (const m of props.metrics) {
+    // 同一 step の最新値で上書きされる仕様
+    byKey.get(m.key)!.set(m.step, m.value);
+  }
+  // すべての step を集めて昇順に並べる
+  const allSteps = new Set<number>();
+  for (const m of byKey.values()) for (const s of m.keys()) allSteps.add(s);
+  const steps = Array.from(allSteps).sort((a, b) => a - b);
+
+  return steps.map(step => ({
+    step,
+    train_acc: byKey.get('train_acc')!.get(step) ?? null,
+    train_loss: byKey.get('train_loss')!.get(step) ?? null,
+    val_acc:   byKey.get('val_acc')!.get(step)   ?? null,
+    val_loss:  byKey.get('val_loss')!.get(step)  ?? null,
+  }));
+});
+
+const option = computed<echarts.EChartsOption>(() => ({
+  animation: false,                  // 学習ログ用途なのでアニメなしで安定表示
+  dataset: { source: datasetSource.value },
+  grid: { left: 56, right: 16, top: 40, bottom: 56 },
+  xAxis: {
+    type: 'value',
+    name: 'step',
+    nameLocation: 'middle',
+    nameGap: 30,
+    minorTick: { show: true },
+    minorSplitLine: { show: true }
+  },
+  yAxis: {
+    type: 'value',
+    name: 'value',
+    nameLocation: 'middle',
+    nameGap: 40,
+    axisLabel: { formatter: (v: number) => v.toFixed(3) }
+  },
+  legend: { top: 4 },
+  tooltip: {
+    trigger: 'axis',
+    axisPointer: { type: 'cross' },
+    valueFormatter: v => (typeof v === 'number' ? v.toFixed(6) : String(v)),
+    order: 'seriesDesc',
+  },
+  dataZoom: [
+    { type: 'inside', start: 0, end: 100 }, // ホイールでズーム可能
+    { type: 'slider', bottom: 8 },
+  ],
+  series: KEYS.map(k => ({
+    type: 'line',
+    name: k,
+    encode: { x: 'step', y: k },
+    showSymbol: false,     // 点マーカーを消して軽量化
+    sampling: 'lttb',      // 点が多いときに見た目を崩さず間引き
+    connectNulls: false,   // 欠損は線を繋げない
+    // smooth: true,       // 好みでスムージング
+  })),
+}));
+
+onMounted(() => {
+  if (!chartEl.value) return;
+  chart = echarts.init(chartEl.value, undefined, { renderer: 'canvas' });
+  chart.setOption(option.value);
+  const onResize = () => chart?.resize();
+  window.addEventListener('resize', onResize);
+  onBeforeUnmount(() => window.removeEventListener('resize', onResize));
+});
+
+// metrics が更新されるたびに option を再適用
+watch(option, (opt) => {
+  if (!chart) return;
+  chart.setOption(opt, { notMerge: true, lazyUpdate: true });
+});
+</script>
+
+3) 親側の使い方（定期更新に追随）
+
+metrics をリアクティブ配列として持たせ、学習ループやポーリング/WebSocket/SSE などから届くたびに push してください。グラフ側は自動で再描画されます。
+
+<!-- views/TrainingDashboard.vue -->
+<template>
+  <MetricsLineChart :metrics="metrics"/>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount } from 'vue';
+import MetricsLineChart from '@/components/MetricsLineChart.vue';
+import type { Metric, MetricKey } from '@/types';
+
+const metrics = ref<Metric[]>([]);
+
+// --- 例：デモ用の擬似更新（実運用はAPI/SSE/WebSocketに差し替え） ---
+let timer: number | undefined;
+onMounted(() => {
+  let step = 0;
+  timer = window.setInterval(() => {
+    // 4キーぶんをまとめて追加（順不同でもOK）
+    metrics.value.push(
+      { key: 'train_acc', value: Math.random()*0.2 + 0.7, step },
+      { key: 'train_loss', value: Math.random()*0.1 + 0.3, step },
+      { key: 'val_acc',   value: Math.random()*0.2 + 0.68, step },
+      { key: 'val_loss',  value: Math.random()*0.1 + 0.32, step },
+    );
+    step += 1;
+  }, 1000);
+});
+onBeforeUnmount(() => { if (timer) clearInterval(timer); });
+</script>
+
+4) 運用の小ワザ
+	•	**ウィンドウ表示（直近 N ステップだけ）**にしたい場合は、datasetSource 計算後に slice(-N) してください。
+	•	重複 step の更新は最新値で上書きになるロジックです（Map で実装済）。
+	•	大量データでも sampling: 'lttb' と showSymbol: false で軽く動きます。更新頻度が高い場合は、親側で 250〜500ms 程度のthrottleをかけると更に安定します。
+	•	Pinia を使うなら、metrics をストアで持たせてこのコンポーネントには computed(() => store.metrics) を渡すだけでOKです。
+
+5) 依存の導入
+
+# Vite プロジェクトで
+npm i echarts
+# または
+yarn add echarts
+
+このままコピペで動くはず。もし色や凡例名、y軸スケール、スムージングなど細かい調整が必要なら、そのまま option の該当箇所を触れば OK。欲しい見た目や挙動があれば教えて、そこに寄せてチューニングするね。
