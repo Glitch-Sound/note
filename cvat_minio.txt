@@ -110,4 +110,88 @@ SignatureDoesNotMatch が出たら、まず Host ヘッダとサブパス禁止�
 	•	必須条件：専用サブドメイン直下で API をプロキシ／Host を保持／CORS 設定。 ￼ ￼
 	•	CVAT 側：Cloud Storage に Endpoint URL と AK/SK を設定すれば OK。 ￼ ￼
 
-必要なら、あなたのドメイン名・既存 compose/helm 構成に合わせた 具体的な NGINX サーバーブロック／docker-compose の env 設定まで落とし込みます。どの形で運用中か（ホスト名、TLS 終端の場所、CVAT/MinIO のバージョン）だけ教えてください。
+必要なら、あなたのドメイン名・既存 compose/helm 構成に合わせ
+た 具体的な NGINX サーバーブロック／docker-compose の 
+env 設定まで落とし込みます。どの形で運用中か（ホスト名、TLS 終端の場所、CVAT/MinIO のバージョン）だけ教えてください。
+
+
+
+
+
+
+
+
+---
+結論：対策できます。いまの構成だと、CVAT から指定している URL が MinIO のコンソール(9001) を /minio にプロキシしたものになっています。しかし CVAT が必要なのは S3 API(9000) のエンドポイントです。さらに S3 の署名仕様上、/minio のようなサブパス配下で S3 API を出すと署名がずれて 403/SignatureDoesNotMatch になりやすいため、API をサブパスに載せるのは非推奨です。MinIO 公式も「API はドメイン直下、コンソールは /minio サブパス可」と案内しています。 ￼
+
+⸻
+
+直し方（おすすめ順）
+
+1) いちばん簡単：CVAT から MinIO:9000 を直接叩く
+	•	CVAT の Cloud Storage 設定（Provider: AWS S3 互換）で
+	•	Endpoint URL: http://xxx:9000（※コンソールではなく S3 API）
+	•	Access key / Secret key / Bucket 名 を設定
+	•	CVAT サーバ（コンテナ）から xxx:9000 に到達できれば、ブラウザから MinIO を直接見せる必要はありません。
+MinIO の API をサブパスに載せないので署名のズレも起きません。
+（CVAT の Cloud Storage 設定手順は公式ドキュメント参照） ￼
+
+2) どうしても NGINX 経由にしたい：API は“ルート”、コンソールは“/minio”
+	•	S3 API(9000) は 別ホスト名（または別ポート）のルートでプロキシします
+例）http://s3.xxx → http://127.0.0.1:9000
+	•	コンソール(9001) は今のように /minio サブパスで OK（必要なら MINIO_BROWSER_REDIRECT_URL を http://xxx:8080/minio/ に設定） ￼
+
+サンプル nginx（要点のみ）：
+
+# S3 API はルートで（サブパス不可）
+server {
+  listen 80;
+  server_name s3.xxx;                 # 例：s3 用の名前
+  client_max_body_size 0;
+  location / {
+    proxy_set_header Host $host;      # 署名検証で必須
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://127.0.0.1:9000;
+    proxy_buffering off;
+  }
+}
+
+# コンソールは /minio サブパスで OK
+server {
+  listen 8080;
+  server_name xxx;
+
+  location ^~ /minio/ {
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    rewrite ^/minio/(.*)$ /$1 break;  # コンソール内部パスに合わせる
+    proxy_pass http://127.0.0.1:9001/;
+  }
+
+  # （既存の CVAT へのプロキシはそのまま）
+  location / {
+    proxy_pass http://127.0.0.1:8080; # CVAT
+  }
+}
+
+ポイント
+	•	API をサブパスに載せない（署名計算上サポートされません）。 ￼
+	•	署名整合性のため proxy_set_header Host $host; を必ず付ける（Host が変わると署名不一致）。 ￼
+	•	コンソールを /minio に置く場合は MINIO_BROWSER_REDIRECT_URL を外向き URL にしておくとリンクが正しくなります。 ￼
+
+⸻
+
+ありがちなハマりどころ（チェックリスト）
+	•	CVAT の Endpoint URL を 9001 や /minio にしていないか？ → NG（コンソールは API ではない）
+	•	API を /minio サブパスでプロキシしていないか？ → NG（署名崩れ） ￼
+	•	NGINX で proxy_set_header Host を落としていないか？ → NG（Host が変わると署名不一致） ￼
+	•	CVAT から MinIO:9000 に到達できるか？（Docker ネットワーク／FW でブロックしていないか）
+	•	バケット名・権限が正しいか？（認証エラー時は CVAT 側ログも確認）
+	•	（参考）MinIO 側は S3 互換 API なので、CVAT の S3 連携で問題なく使えます。 ￼
+
+⸻
+
+必要なら、あなたの現在の nginx 設定（server/location 部分）と CVAT の Cloud Storage 入力値（Endpoint、Bucket など）を書いてくれれば、そのまま差し替え可能な最小変更パッチにして返します。
