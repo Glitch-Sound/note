@@ -518,3 +518,111 @@ docker compose exec cvat_worker curl -I \
 
 ここまでやってもダメなら、Cloud Storage の設定値（Bucket/Prefix、Use manifest の有無）と、タスク作成画面の Data type・pattern のスクショをもう1枚ください。
 その情報に合わせて「この値をこう直せば OK」という最小パッチで返します。
+
+
+
+---
+
+CVatとminioが動いてるマシンがあるが、80と8080ポート以外は開けない制限があり、プロキシしている事情がある
+
+Minioを8081にし、cvatのエントリーポイントに設定したとして、複数ユーザが別マシンからcvatにアクセスして編集することは可能か
+
+結論：可能です。
+ただし S3 API を “サブパス無しのルート” で公開し、かつ クライアントのブラウザからも到達できるホスト名にするのがポイントです。
+ポートが 80/8080 しか開けない制約でも、名前ベースの仮想ホストで同じ 8080 に CVAT と MinIO API を同居させれば OK です。
+
+⸻
+
+おすすめ構成（8080 だけ開けたまま）
+
+1) ホスト名を 2 つ用意（同じ IP でOK）
+	•	cvat.example.local:8080 … CVAT UI（今まで通り）
+	•	s3.example.local:8080 … MinIO S3 API（サブパス無しの /）
+
+※ 社内 DNS で 2 つの名前を同じ IP に向ける（難しければ各PCの hosts でも可）。
+※ IP直打ちは不可（Host ヘッダが固定になり SigV4 署名がずれるため）。
+
+2) NGINX（同じ 8080 で名前ベース振り分け）
+
+# MinIO S3 API を 8080 の "s3.example.local" でルート公開
+server {
+  listen 8080;
+  server_name s3.example.local;
+  client_max_body_size 0;
+
+  location / {
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;              # ← 署名で必須
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off;
+    proxy_pass http://127.0.0.1:9000;         # MinIO API (内部)
+  }
+}
+
+# CVAT UI を 8080 の "cvat.example.local" に
+server {
+  listen 8080;
+  server_name cvat.example.local;
+
+  location / {
+    proxy_pass http://127.0.0.1:8082;         # 例: CVAT 本体は内部 8082 で稼働
+  }
+
+  # （任意）MinIO コンソールは /minio に載せるのはOK（APIはダメ）
+  location ^~ /minio/ {
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    rewrite ^/minio/(.*)$ /$1 break;
+    proxy_pass http://127.0.0.1:9001/;        # MinIO Console
+  }
+}
+
+重要：API を /minio などのサブパスに置かないこと。署名が一致せずエラーになります。
+
+3) CVAT 側の Cloud Storage 設定
+	•	Provider: AWS S3
+	•	Endpoint URL: http://s3.example.local:8080  ← サブパス無し
+	•	Access key / Secret key: MinIO のキー（例：admin / password）
+	•	Bucket: 例 mybucket
+	•	Prefix: 例 datasets/projectA/（先頭/なし、バケット名を含めない、末尾/推奨）
+	•	Advanced: Use path-style addressing = ON（MinIO はこれが安定）
+	•	（まずは）Read-only = ON にして登録テストを通す
+
+4) CORS（ブラウザからのアクセス用）
+
+MinIO 側で CORS を設定（少なくとも GET/HEAD、必要なら PUT）。AllowedOrigins に
+http://cvat.example.local:8080 を追加。
+
+⸻
+
+これで「複数ユーザが別マシンから CVAT を使う」時の挙動
+	•	タスク作成時：CVAT サーバ／ワーカーが s3.example.local:8080 にアクセスしてクラウド上の動画を取得。
+UI からの一覧表示や取り込み処理も OK。
+	•	アノテーション時：通常は CVAT が取り込んだフレームを配信するので、ユーザのブラウザは CVAT だけにアクセスすれば編集可能。
+ただし一部機能で署名 URL を返すケースに備え、ユーザ側からも s3.example.local:8080 が解決・到達できる状態にしておくと堅牢です（だから DNS/hosts を用意）。
+
+⸻
+
+代替パターン（どうしても DNS 名を増やせない場合）
+	•	サーバ内向けだけに MinIO を 8081 で動かし、Endpoint を http://127.0.0.1:8081 にする方法もあります。
+その場合、CVAT サーバ／ワーカーは到達できますが、ブラウザが S3 に直接行く機能を使うと失敗する可能性があるので、**基本は CVAT に取り込み（ローカルコピー）**させて使ってください。
+
+⸻
+
+最終チェックリスト
+	•	MinIO API はルートで公開（サブパス禁止）
+	•	CVAT Endpoint は http://<s3-host>:8080（Host ベースの仮想ホスト）
+	•	Use path-style = ON
+	•	CORS の AllowedOrigins に CVAT の Origin を追加
+	•	worker からも curl -I http://s3.example.local:8080/minio/health/ready が 200
+	•	タスク作成時は Select data source = Videos
+
+この形にすれば、ポート制約（80/8080のみ）でも複数ユーザが問題なく CVAT を使って動画のアノテーションができます。
+
+
+
+
+
