@@ -877,3 +877,77 @@ ffmpeg -i input.avi -c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k -movf
 
 
 
+
+
+
+
+--
+
+OK、そのUIなら Filename pattern が無いタイプです。
+結論だけ先に：manifest.jsonl を置けば解決できます。（“All files しか選べない”UIでも動画を正しく認識させられます）
+
+⸻
+
+やり方：manifest.jsonl を使う（確実）
+
+1) manifest を作る
+
+手元に動画を1本落として（または既にあるファイルを使って）下で生成します。
+
+# 例: カレントに your_video.avi がある想定
+docker run --rm -u "$(id -u)":"$(id -g)" -v "$PWD":/local \
+  --entrypoint python3 cvat/server \
+  utils/dataset_manifest/create.py --output-dir /local /local/your_video.avi --force
+
+→ カレントに manifest.jsonl ができます。
+（複数動画があるなら、このコマンドをファイルごとに実行してください）
+
+2) MinIO の同じ場所へアップ
+
+mc alias set m http://<minio-host>:9000 admin password
+mc cp manifest.jsonl m/<BUCKET>/<PREFIX>/
+
+PREFIX は 先頭スラッシュなし / バケット名を含めない / 末尾/推奨（例 data/video_driving/00000001/）
+
+3) CVAT に manifest を使わせる
+
+方法はどちらでもOK（出る場所はバージョンで違います）。
+	•	A. Cloud Storage を編集して
+Use manifest を ON → Manifest path に manifest.jsonl を設定して保存。
+（このやり方だと、タスク作成時は何も気にせずそのストレージを選ぶだけ）
+	•	B. タスク作成の Cloud Storage タブに Use manifest が出る版なら、
+そこを ON にして manifest.jsonl と入力。
+
+以後は Select data source が All files のままでもOK。
+一覧で動画にチェックを入れると、右上の Selected: N が 1以上 になり、そのまま進めば落ちません。
+
+⸻
+
+もし manifest なしで進めるなら（UI上の注意点）
+	•	一覧のチェックボックスで 対象動画を必ず選択し、右上の Selected: N が 1以上 になっていることを確認してから Continue。
+→ N=0 のまま進むと、ワーカーで IndexError: list index out of range が出ます（あなたのログの正体）。
+	•	サブフォルダなら Include subdirectories を ON。
+	•	それでも不安定なら manifest を使うのが早いです。
+
+⸻
+
+仕上げチェック（念のため）
+	•	Cloud Storage 登録：Endpoint = http://minio:9000（サブパス/9001不可）、Use path-style = ON
+	•	cvat_worker_import から MinIO に疎通できる
+
+docker compose exec cvat_worker_import curl -I http://minio:9000/minio/health/ready
+
+→ 200 OK
+
+	•	MinIO 権限：s3:ListBucket, s3:GetObject, s3:HeadObject
+
+⸻
+
+まとめ
+	•	UIに pattern が無く、Select data source が All しか無くても大丈夫。
+	•	manifest.jsonl を同じプレフィックスに置いて Use manifest を有効にすれば、動画として確実に取り込めます。
+	•	まずは1本で試してOKなら、複数動画にも同じ手順を適用してください。
+
+
+
+
