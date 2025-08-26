@@ -394,3 +394,127 @@ docker compose exec cvat_worker curl -I \
 もし .env / docker-compose.yml（server/worker の environment 周り）と、
 Cloud Storage 入力値（Endpoint, Bucket, Prefix, Use manifest 有無）を貼ってもらえれば、そのまま差し替えられる最小修正パッチを作って返します。ログ断片（数行）もあれば原因を特定しやすいです。
 
+
+
+
+
+
+
+
+
+---
+
+スクショのスタックトレース、ここが核心です。
+
+_create_task_manifest_from_cloud_data(...)
+manifest.link(sources=content, ...)
+self._raw_data_used = not isinstance(sources[0], str)
+IndexError: list index out of range
+
+＝ CVAT が “取り込み対象のファイル一覧（sources）を 1 件も見つけられていない” まま処理に入って、空配列の sources[0] を踏んでコケています。
+つまり「Cloud Storage の接続自体は通ったが、タスク作成で“対象ファイルが0件扱い” になっている」状態です。
+
+すぐ効く順に直し方を書きます。
+
+⸻
+
+まずここを直してください（高確率で解決）
+
+1) 「データの種類」が実ファイルと合っているか
+
+タスク作成画面の Data type（Images / Video / DICOM / Archive）で、
+動画なら必ず “Video” を選択してください。
+ここが Images になっていると、拡張子でフィルタされて 0件 になり、今回のエラーになります。
+
+2) Prefix（パス）が正しいか
+
+Cloud Storage の設定で：
+	•	Bucket：mybucket
+	•	Prefix：projects/foo/bar/ のように、バケット名は入れない／先頭に / を付けない
+	•	動画がサブフォルダにあるなら、タスク作成側で Include subdirectories をオン
+
+ありがちミス
+	•	Prefix に /mybucket/... と書いてしまう
+	•	Prefix の末尾 / を落としてディレクトリ解決に失敗
+
+3) パターン（ファイル絞り込み）で除外していないか
+
+Advanced → Filename pattern を使っていたら、一旦空（デフォルト）に戻すか、次にします：
+
+.*\.(mp4|avi|mov|mkv)$
+
+※ 実際の拡張子に合わせてください。
+
+⸻
+
+それでもダメなら（次の一手）
+
+4) manifest.jsonl を置く（動画は特に安定）
+
+同じプレフィックスに manifest.jsonl を置き、タスク作成時に Use manifest をオン。
+生成コマンド例（CVAT サーバ画像を使う）：
+
+docker run --rm -u "$(id -u)":"$(id -g)" -v "$PWD":/local \
+  --entrypoint python3 cvat/server \
+  utils/dataset_manifest/create.py --output-dir /local /local/video.mp4
+
+できた manifest.jsonl を MinIO の Prefix 直下にアップし、UI では相対パスで manifest.jsonl を指定。
+
+5) cvat_worker から本当に見えているかを確認
+
+server では見えても worker から見えていない と 0 件になります。両方で疎通確認：
+
+docker compose exec cvat_server curl -s -I http://<minio-host>:9000/minio/health/ready
+docker compose exec cvat_worker curl -s -I http://<minio-host>:9000/minio/health/ready
+
+どちらも 200 OK であること。
+
+もし worker だけ失敗するなら
+	•	.env または compose に SMOKESCREEN_OPTS（プライベートレンジ許可）を server と worker 両方へ入れる
+
+SMOKESCREEN_OPTS=--allow-range=<あなたのDockerネットワークCIDR>
+
+
+	•	no_proxy に MinIO ホスト（と :9000）を追加
+
+6) S3 権限（List は通るが Get で落ちて 0 件扱い）
+
+使っているユーザ／ポリシーに、対象バケットへ最低限これが必要です：
+	•	s3:ListBucket
+	•	s3:GetObject, s3:HeadObject
+
+7) コーデック不一致・壊れかけ
+
+ffmpeg が読めない動画だと、検出段階で “無効” と判断され 0 件になることがあります。
+一度 H.264/AAC へ再エンコードして試すのが早いです：
+
+ffmpeg -i input.avi -c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k -movflags +faststart output.mp4
+
+
+⸻
+
+3分診断（どこで 0 件になっているか見る）
+	1.	タスク作成画面で Data type を Video にすると、右側のカウントが 1 files（または該当数）になるか？
+→ なら OK。0 files のままなら上の 1)～3) をやり直し。
+	2.	ブラウザ開発者ツール → Network で POST /api/tasks 以降のレスポンス本文を見る。
+sources: [] や “no media found” の文言があれば、やはりファイル 0 件扱い。
+	3.	worker から実ファイルに直接 HEAD：
+
+docker compose exec cvat_worker curl -I \
+  "http://<minio-host>:9000/<BUCKET>/<Prefix>/video.mp4"
+
+403/404/timeout なら #5 or #6 を疑う。
+
+⸻
+
+最後にチェックリスト
+	•	タスク作成の Data type = Video
+	•	Prefix の書き方（先頭に / を付けない／バケット名を重ねない／末尾 /）
+	•	Include subdirectories（必要ならオン）
+	•	Filename pattern で除外していない
+	•	（推奨）manifest.jsonl を置いて指定
+	•	worker からも MinIO に到達できる（Smokescreen / no_proxy）
+	•	MinIO のポリシーに List/Get/Head
+
+ここまでやってもダメなら、Cloud Storage の設定値（Bucket/Prefix、Use manifest の有無）と、タスク作成画面の Data type・pattern のスクショをもう1枚ください。
+その情報に合わせて「この値をこう直せば OK」という最小パッチで返します。
