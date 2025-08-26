@@ -951,3 +951,20 @@ docker compose exec cvat_worker_import curl -I http://minio:9000/minio/health/re
 
 
 
+
+---
+
+# 1) 作業用フォルダへ移動（動画ファイルをここに置く）
+cd /path/to/workdir
+
+# 2) manifest.jsonl を生成（your_video.avi をお好みで置換）
+docker run --rm -u 0:0 \
+  -v "$PWD":/work -w /work \
+  cvat/server \
+  python3 -m cvat.utils.dataset_manifest.create \
+    --output-dir /work /work/your_video.avi --force
+
+
+
+
+
