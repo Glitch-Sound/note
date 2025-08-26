@@ -1017,3 +1017,58 @@ CVAT 側の使い方（おさらい）
 
 
 
+
+
+
+---
+
+スクショのエラー、原因はこれです👇
+	1.	unable to find user at-nw
+　→ -u 0:0 ではなく、途中で -u at-nw になってしまっている
+	2.	./backend_entrypoint.sh: no such file or directory
+　→ cvat/server イメージの ENTRYPOINT が起動してしまい、python3 ... が実行されていない
+　（--entrypoint python3 で上書きが必要）
+	3.	コマンドの途中に docker run ... が混入
+　→ コピペ時に改行が消えて “引数の一部” になっています
+
+⸻
+
+これを丸ごとコピペ（バックスラッシュ無し・フル権限で確実に通す）
+
+cd /path/to/workdir
+sudo chmod -R 777 .
+
+# まず対象動画が見えることを確認
+ls -l 20200426140719_0.mp4
+
+# manifest.jsonl を生成（ENTRYPOINT を python3 に上書き）
+sudo docker run --rm -u 0:0 -v "$PWD":/work -w /work --entrypoint python3 cvat/server -m cvat.utils.dataset_manifest.create --output-dir /work /work/20200426140719_0.mp4 --force
+
+上記でうまくいかない環境向けの“絶対通る版”（スクリプトパスを直指定）：
+
+sudo docker run --rm -u 0:0 -v "$PWD":/work -w /work --entrypoint python3 cvat/server /home/django/utils/dataset_manifest/create.py --output-dir /work /work/20200426140719_0.mp4 --force
+
+実行後、./manifest.jsonl ができているはずです（ls -l manifest.jsonl で確認）。
+
+⸻
+
+MinIO にアップして CVAT で使う
+
+mc alias set m http://<minio-host>:9000 admin password
+mc cp manifest.jsonl m/<BUCKET>/<PREFIX>/
+
+	•	<PREFIX> は先頭スラッシュ無し、バケット名を含めない、末尾 / 推奨（例：data/video_driving/00000001/）
+
+CVAT のタスク作成（Cloud Storage）で Use manifest を ON → manifest.jsonl を指定。
+UI が All files しか出なくても、これで動画として確実に取り込めます（先の IndexError: list index out of range は解消）。
+
+⸻
+
+もしまだコケたら
+	•	コマンドを1行で（途中に別の docker run が混ざっていないか）
+	•	--entrypoint python3 が入っているか
+	•	/work/20200426140719_0.mp4 が実在するか（ls -l で確認）
+	•	エラーメッセージ冒頭数行をそのまま貼ってください。原因に合わせて調整します。
+
+
+
