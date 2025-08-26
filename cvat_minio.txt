@@ -724,3 +724,69 @@ CVAT が MinIO から動画を取り込んでフレームを自前配信する�
 
 
 
+
+
+
+
+---
+
+結論：MinIO への読み込みで“対象”になるのは cvat_worker_import（＋ cvat_server）です。
+
+役割ざっくり
+	•	cvat_server … UI/API。Cloud Storage の一覧取得や設定保存を担当。
+	•	✅ cvat_worker_import … クラウド上のメディアを実際に取りに行き、ffmpeg で解析→フレーム展開/manifest作成。
+今出ていた IndexError … create_task_manifest_from_cloud_data はここで発生。
+	•	cvat_worker_export … 書き戻し/エクスポート時に S3 へ出力するときに使う。
+	•	cvat_worker_annotation / quality_reports / webhooks / analytics … 今回は無関係。
+
+⸻
+
+つまり、設定を入れるべきコンテナ
+	•	必須：cvat_server と cvat_worker_import
+	•	（S3 に書き戻す運用なら）cvat_worker_export にも同じ設定を
+
+入れる環境変数（例）
+
+services:
+  cvat_server:
+    environment:
+      SMOKESCREEN_OPTS: --allow-range=<あなたのDockerネットワークCIDR>
+      no_proxy: "localhost,127.0.0.1,minio,s3,<minio-host>,<minio-host>:9000"
+  cvat_worker_import:
+    environment:
+      SMOKESCREEN_OPTS: --allow-range=<同上CIDR>
+      no_proxy: "localhost,127.0.0.1,minio,s3,<minio-host>,<minio-host>:9000"
+  # 書き戻すなら
+  cvat_worker_export:
+    environment:
+      SMOKESCREEN_OPTS: --allow-range=<同上CIDR>
+      no_proxy: "localhost,127.0.0.1,minio,s3,<minio-host>,<minio-host>:9000"
+
+CIDR は docker network inspect <ネットワーク名> の Subnet を使ってください。
+
+⸻
+
+同一ネットワークでの疎通テスト
+
+（Compose のサービス名が minio の想定。違う場合は読み替え）
+
+# server から
+docker compose exec cvat_server curl -s -I http://minio:9000/minio/health/ready
+# import worker から
+docker compose exec cvat_worker_import curl -s -I http://minio:9000/minio/health/ready
+# どちらも 200 OK になれば到達OK
+
+
+⸻
+
+補足（コマンド名の見分け方）
+
+docker compose ps で サービス名 を確認して実行してください。
+画面に見えるコンテナ名が ai-pf_cvat_worker_import でも、Compose の サービス名は cvat_worker_import のはずです（前に プロジェクト名_ が付くだけ）。
+
+⸻
+
+この2つ（server と import worker）にネットワーク許可・no_proxy を入れて再起動すれば、MinIO からの動画タスク作成が安定します。必要なら、あなたの docker-compose.yml の該当部分を貼ってくれれば、最小差分のパッチにして返します。
+
+
+
