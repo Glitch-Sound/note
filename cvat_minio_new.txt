@@ -1,0 +1,172 @@
+はい、可能です。MinIO（S3互換）に置いた動画を CVAT 側から「クラウドストレージ」として参照し、タスクを作ってアノテーションできます。ポイントは ①CVAT に MinIO を S3 として登録（endpoint_url を指定）、②（同一ホスト／同一ネットワークの場合）CVAT の “Private range” ブロックを許可、③タスク作成時に cloud_storage_id + server_files を使う、の3つです。公式ドキュメント上の該当箇所も貼っておきます。 ￼ ￼
+
+⸻
+
+最小構成（Docker）
+
+同一 Docker ネットワーク上で CVAT と MinIO を動かす例です。既に CVAT を動かしている場合は、MinIO を同じネットワークに参加させるだけでOKです。
+
+1) MinIO（S3）を起動
+
+# docker-compose.minio.yml
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345678
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Console
+    volumes:
+      - minio_data:/data
+    networks: [cvatnet]
+
+volumes:
+  minio_data:
+
+networks:
+  cvatnet:
+    external: true  # 既存の CVAT ネットワーク名に合わせてください
+
+先に docker network create cvatnet で外部ネットワークを作っておくか、CVAT 側の compose と同名にそろえてください。同一ネットワークに載せると CVAT コンテナから http://minio:9000 で解決できます。（他ツールでも同様の注意が推奨されています） ￼
+
+バケットと動画を用意（MinIO Client mc）
+
+# 同一ネットワークで mc を一時起動し、MinIO に alias を貼る
+docker run --rm -it --network cvatnet minio/mc \
+  mc alias set local http://minio:9000 minio minio12345678
+
+# バケット作成
+docker run --rm -it --network cvatnet -v "$PWD:/work" minio/mc \
+  sh -lc 'mc mb -p local/videos && mc cp /work/sample.mp4 local/videos/'
+
+2) CVAT の “Private range” 許可（ローカル/同一ネットワーク向け）
+
+CVAT は SSRF 対策でプライベートアドレス宛の外部アクセスをデフォルト拒否します。MinIO が同一ホスト/同一ネットワーク上なら、SMOKESCREEN_OPTS で CIDR を許可してください（例：172.18.0.0/16）。この設定は CVAT のプロキシ（Smokescreen）に渡します。 ￼
+
+# 例: CVAT の docker-compose.yml（該当サービスに追加）
+services:
+  cvat_proxy:
+    environment:
+      - SMOKESCREEN_OPTS=--allow-range=172.16.0.0/12
+    # ↑ あなたの docker network のサブネットに合わせる
+
+
+⸻
+
+CVAT から MinIO を「クラウドストレージ」として登録
+
+CVAT の UI からも登録できますが、ここでは API / Python SDK の最小例を示します。
+
+CVAT は「クラウドストレージ」経由で S3 / GCS / Azure を参照できます。MinIO は S3 互換なので Provider=AWS S3 を選び、specific_attributes に endpoint_url を与えます。 ￼
+
+Python SDK 例（クラウドストレージ作成 → 動画でタスク作成）
+
+# pip install "cvat-sdk>=2.40"
+from cvat_sdk.api_client import Configuration, ApiClient
+from cvat_sdk.api_client.models import (
+    CloudStorageWriteRequest, CredentialsTypeEnum, TaskWriteRequest, DataRequest
+)
+
+CVAT_URL = "http://localhost:8080"  # CVAT の外部URL
+USERNAME = "admin"
+PASSWORD = "********"
+
+with ApiClient(Configuration(host=CVAT_URL, username=USERNAME, password=PASSWORD)) as client:
+    # 1) MinIO バケットをクラウドストレージとして登録
+    cs_req = CloudStorageWriteRequest(
+        provider_type="AWS_S3_BUCKET",
+        display_name="minio-videos",
+        resource="videos",  # バケット名
+        credentials_type=CredentialsTypeEnum("KEY_SECRET_KEY_PAIR"),
+        key="minio",            # MINIO_ROOT_USER
+        secret_key="minio12345678",  # MINIO_ROOT_PASSWORD
+        # MinIO を使う肝: endpoint_url を指定（同一ネットワークならホスト名 minio:9000）
+        specific_attributes="endpoint_url=http://minio:9000"
+        # 必要なら "region=us-east-1" なども追加可（改行またはセミコロン区切り）
+    )
+    cs = client.cloudstorages_api.create(cs_req)[0]  # 作成
+    print("cloud_storage_id =", cs.id)
+
+    # 2) 空のタスクを作成
+    task_spec = TaskWriteRequest(
+        name="annotate-sample-mp4",
+        segment_size=200,  # チャンクサイズは好みで
+        labels=[]          # ラベルは後からでも可
+    )
+    task = client.tasks_api.create(task_spec)
+
+    # 3) タスクに動画データをアタッチ（クラウドストレージ上のパスを指定）
+    #    server_files: バケットの中のパス。例: videos バケット直下なら "sample.mp4"
+    data_req = DataRequest(
+        server_files=["sample.mp4"],
+        cloud_storage_id=cs.id,
+        use_cache=True,   # 大きい動画はキャッシュ有効が快適
+        copy_data=False   # False=都度参照, True=CVAT側にコピー
+    )
+    client.tasks_api.create_data(task.id, data_req)
+    print("task_id =", task.id)
+
+	•	cloud_storage_id と server_files の組み合わせで「どのクラウドストレージのどのファイルを読むか」を指定します（SDK の DataRequest 仕様）。 ￼
+	•	specific_attributes に endpoint_url=http://minio:9000 のように渡す形は、実運用で使われている形式です。 ￼
+	•	クラウドストレージ作成 API は CloudstoragesApi.create を使います（SDK リファレンス）。 ￼
+
+⸻
+
+（任意）Manifest を使う場合の注意
+	•	クラウド上の大量データやキャッシュ有効時は Manifest（*.jsonl）を使うとタスク作成が高速です。CVAT 公式は Manifest の用途と作り方を明示しています。 ￼
+	•	動画用の Manifest は JSONL（1行1オブジェクト）で、ヘッダ行に "type":"video" と properties.name（=動画ファイル名）を持ちます。これを満たさないと 「name が無い」系エラーになります。 ￼
+
+最小サンプル（video 用 manifest.jsonl）
+
+{"version":"1.0","type":"video","properties":{"name":"sample.mp4"}}
+
+単純な動画1本なら上のヘッダ行だけで充分です。これを videos バケットに manifest.jsonl の名で置き、server_files=["manifest.jsonl"] としてタスク作成すれば、バケット内の sample.mp4 を参照します。Manifest の仕様詳細は公式参照。 ￼
+
+Manifest を使うタスク作成（差分）
+
+data_req = DataRequest(
+    server_files=["manifest.jsonl"],  # ← manifest を指定
+    cloud_storage_id=cs.id,
+    filename_pattern="*.mp4",         # 必要なら絞り込み（fnmatch）
+    use_cache=True,
+)
+
+（filename_pattern / server_files_exclude の挙動は DataRequest の仕様に準拠） ￼
+
+⸻
+
+UI でやる場合（超要約）
+	1.	CVAT 画面右上「Cloud storages」→「＋」
+	2.	Provider = AWS S3、Bucket name = videos、Auth = Key/Secret
+	3.	Advanced（または相当欄）で endpoint_url を MinIO に指定（例 http://minio:9000）
+	4.	以後、タスク作成時に「Cloud storage」タブからファイル or manifest.jsonl を選択
+（UI 手順の公式） ￼
+
+⸻
+
+ハマりどころ（ローカル/オンプレでよくある）
+	•	Private range ブロック
+CVAT の SSRF 対策で、プライベート IP 宛の外部アクセスがデフォ拒否です。同一ネットワークの MinIO に行く場合は SMOKESCREEN_OPTS=--allow-range=... を設定してください。エラー文に “Deny: Private Range” が出ます。 ￼
+	•	NGINX 経由で MinIO を出す場合
+endpoint_url は NGINX の公開 URL/ポートに。自己署名証明書なら CVAT 側の信頼設定も検討（本回答では割愛）。
+	•	ネットワーク解決
+Compose を分けて起動していると別ネットワークになりがちです。同じ外部ネットワークに参加させて http://minio:9000 で到達できるようにしてください。 ￼
+
+⸻
+
+参考（一次情報）
+	•	クラウドストレージの使い方（UI 手順・S3 例、Manifest は任意） ￼
+	•	Dataset Manifest（動画/画像の JSONL 仕様、作成ツール、用途） ￼
+	•	タスク作成時の DataRequest（cloud_storage_id と server_files の関係） ￼
+	•	Cloudstorages API / SDK リファレンス（create の使い方） ￼
+	•	specific_attributes に endpoint_url を渡す例（MinIO 連携で実用） ￼
+
+⸻
+
+必要なら、あなたの現行 docker-compose.yml（CVAT/MinIO/NGINX）に合わせて、最小変更パッチ（差分）を書きます。配置やポート、ネットワーク名を教えてくれれば、即座に適用できる形で出します。
+
+
+
