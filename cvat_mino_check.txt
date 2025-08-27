@@ -447,6 +447,91 @@ UI に「Use path-style / Use HTTPS」のトグルが無いバージョンでも
 
 
 
+---
+
+
+
+添付のエラーがでる
+
+
+---
+
+
+
+スクショのログで核心はここ👇
+decision_reason: "The destination address (192.168.128.20) was denied by rule 'Deny: Private Range'"
+proxy_type: "http"  requested_host: "minio:9000"
+
+＝ CVAT サーバーの外向き通信が HTTPプロキシ経由に強制され、そのプロキシが プライベートIP宛の通信を拒否 しています。
+この状態だと minio:9000（同一Dockerネットワーク内）へもプロキシ越しに出ようとしてブロック→「ai-pf が見つからない」エラーに見えます。
+
+すぐ直す：コンテナ内のプロキシを無効化（NO_PROXY 設定）
+
+docker-compose.yml の cvat_server（と必要なら cvat_worker など S3 を触るコンテナ） に以下を追加してください。MinIO 側は同じネットワークにいればOKです。
+
+services:
+  cvat_server:
+    # 既存定義に追記
+    environment:
+      - http_proxy=
+      - https_proxy=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      # Docker内相互通信/社内プライベート帯はプロキシを通さない
+      - NO_PROXY=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - no_proxy=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+    depends_on:
+      - minio
+    networks:
+      - cvat_net   # ← CVAT と MinIO を同じネットワークに
+
+  minio:
+    networks:
+      - cvat_net
+
+networks:
+  cvat_net: {}
+
+重要
+	•	ホストOSやDockerデーモンにプロキシが設定されていても、コンテナレベルで上書きすれば回避できます。
+	•	既に networks: を使っていればその名前に合わせてください。
+
+その上で docker compose up -d を実行。
+
+接続確認（必ずこの2つ）
+
+# ① CVATサーバの中から MinIO に直で到達するか
+docker exec -it <cvat_serverの名前> sh -lc \
+  "getent hosts minio; curl -s -o /dev/null -w '%{http_code}\n' http://minio:9000/minio/health/ready"
+# -> 名前解決の行が出て、HTTP 200 が返ればOK
+
+# ② バケットが見えるか（鍵も確認になる）
+docker run --rm --network <cvat_netの実名> \
+  -e AWS_ACCESS_KEY_ID=admin \
+  -e AWS_SECRET_ACCESS_KEY=password \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli s3 ls --endpoint-url http://minio:9000 s3://ai-pf
+# -> 存在しないと言われたら「作成」してください
+
+バケット未作成なら：
+
+docker run --rm --network <cvat_net> \
+  -e AWS_ACCESS_KEY_ID=admin \
+  -e AWS_SECRET_ACCESS_KEY=password \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli s3 mb --endpoint-url http://minio:9000 s3://ai-pf
+
+CVAT 側の入力値（再確認）
+	•	Provider: AWS S3
+	•	Bucket: ai-pf（存在必須）
+	•	Access/Secret: admin / password（あなたの値に合わせる）
+	•	Endpoint URL: http://minio:9000（同一ネットワークの場合）
+※ 別composeでネットワークを共有していないなら、一時的に http://<UbuntuホストIP>:9000 でもOK
+
+⸻
+
+これで プロキシ経由ブロック → 直結 に切り替わり、ai-pf が正しく見えるはず。
+まだ弾かれる場合は、docker exec -it <cvat_server> env | grep -i proxy の出力を見せてください（消し漏れの環境変数を洗います）。
 
 
 
