@@ -170,3 +170,100 @@ Compose を分けて起動していると別ネットワークになりがちで
 
 
 
+
+---
+
+ありえる原因は大きく3つ。スクショの「404 page not found」の出方から、①の“Host ルール不一致（Traefikのルーティング）”が最有力です。
+
+⸻
+
+① Traefik の Host ルール不一致（最有力）
+
+症状
+CVAT の compose は Traefik でフロントを張っており、デフォルトで
+traefik.http.routers.cvat-xxx.rule = Host(\<CVAT_HOST>`)   のように**ホスト名一致**でルーティングします。   **CVAT_HOST=localhost` のまま**なのに IP（10.71.82.54）でアクセスすると、Traefik が一致せず 404 を返します（まさにそのメッセージの見た目です）。
+
+切り分け
+
+# どちらも CVAT のフロントに公開しているポートで試す（例: 8080）
+curl -I http://10.71.82.54:8080/
+curl -I -H "Host: localhost" http://10.71.82.54:8080/
+
+	•	前者が 404、後者が 200 なら Host ルール不一致確定。
+
+直し方（どれか一つ）
+	•	.env を開いて CVAT_HOST を実際にアクセスするホスト（IP でも可）に変更
+
+CVAT_HOST=10.71.82.54
+
+変更後に docker compose up -d。
+
+	•	もしくは Traefik のラベルを「ホスト名不要」にする
+（例：rule=PathPrefix(\/`)だけにする、あるいはHostRegexp(”{any:.+}”)` を足す）
+	•	もしくは DNS/hosts で CVAT_HOST の値のホスト名でアクセスする
+
+⸻
+
+② UI ではなく バックエンド へ当てている
+
+症状
+/tasks はフロント（SPA）のルートです。バックエンドの 8080 に当てると 404 になります。
+
+切り分け
+
+# バックエンドに当たっているか確認
+curl -i http://10.71.82.54:8080/api/server/about
+
+	•	これが JSON で返るのに / や /tasks が 404 → UI じゃなく API に当たっている
+→ ルータ/ポート公開の設定を見直し（Traefik のエントリポイント → UI にルーティングされているか）
+
+⸻
+
+③ SPA のディープリンク再読み込みで 404（リバプロ設定）
+
+症状
+/ から画面遷移はできるが、/tasks を直接開く/リロードすると 404。
+フロント（React SPA）をリバースプロキシしていると、未知パスを /index.html にフォールバックしない設定だと起きます。
+
+Nginx例（プロキシの設定側）
+
+location / {
+    proxy_pass http://cvat_ui;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # SPA フォールバック
+    error_page 404 = @cvatui_fallback;
+}
+location @cvatui_fallback {
+    rewrite ^ / break;
+    proxy_pass http://cvat_ui;
+}
+
+（try_files $uri /index.html; 系は“ローカルのNginx FS”を見るため、純プロキシでは上記の error_page 方式が確実）
+
+⸻
+
+まずやる最短チェック
+	1.	Host ルールの切り分け
+
+curl -I http://10.71.82.54:8080/
+curl -I -H "Host: localhost" http://10.71.82.54:8080/
+
+→ 後者だけ 200 なら CVAT_HOST を 10.71.82.54 に変更して再起動。
+
+	2.	どこに当たっているか
+
+curl -i http://10.71.82.54:8080/api/server/about
+
+→ これが返るのに /tasks が 404 なら UI ではなく API に当たっている。Traefik/Nginx のルート先を UI に。
+
+	3.	プロキシを使っている場合は SPA フォールバックを追加（上の Nginx 例）。
+
+⸻
+
+必要なら、あなたの docker-compose.yml の Traefik ラベル部分 or Nginx 設定を貼ってください。
+404を確実に潰せる 具体的な差分を書いて返します。
+
+
+
