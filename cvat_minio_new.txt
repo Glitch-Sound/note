@@ -591,3 +591,121 @@ curl -i  http://10.71.82.54:8080/api/server/about    # 200（API）
 
 
 
+
+
+
+---
+
+グッド！ここまでの断片から、表示できない主因は “Host ルールの食い違い” です。
+特に重要なのは labels 内の ${CVAT_HOST} の解決先。Compose の変数展開は .env やシェル環境を見ます。サービスの environment で設定しても labels には効きません。
+いまの書き方だと Host(\${CVAT_HOST:-localhost}`)` が localhost のままになり、Traefik が IP アクセスをルーティングしません。
+
+以下の最小修正だけで復旧できます。
+
+⸻
+
+直すポイント（最小）
+
+1) .env に CVAT_HOST を明示
+
+compose と同じディレクトリに .env（すでにあるなら追記）：
+
+CVAT_HOST=10.71.82.54
+CVAT_VERSION=v2.43.0
+
+これで labels 内の ${CVAT_HOST} が 10.71.82.54 に展開されます。
+サービス内 environment の CVAT_HOST: 10.71.82.54 はそのままでOKですが、labels の展開には使われません。
+
+2) UI と API の Traefik ルータを分離（名前も分ける）
+
+いまの構成は概ね良いですが、router 名を分けておくと衝突を避けられます。
+
+cvat_ui:
+
+labels:
+  - traefik.enable=true
+  - traefik.http.routers.cvat-ui.rule=Host(`${CVAT_HOST}`)
+  - traefik.http.routers.cvat-ui.entrypoints=web
+  - traefik.http.services.cvat-ui.loadbalancer.server.port=80
+
+cvat_server:
+
+labels:
+  - traefik.enable=true
+  - traefik.http.routers.cvat-api.rule=Host(`${CVAT_HOST}`) && (PathPrefix(`/api/`) || PathPrefix(`/admin/`) || PathPrefix(`/static/`) || PathPrefix(`/django-rq/`))
+  - traefik.http.routers.cvat-api.entrypoints=web
+  - traefik.http.services.cvat-api.loadbalancer.server.port=8080
+
+いまの「cvat」という1つの router 名でも動きますが、UI と API は別名にした方が安全です。
+静的ファイル（/logo.svg 等）は UI 側(80) に来る構成です。
+
+3) Traefik の公開ポートと Nginx のプロキシ
+	•	Traefik: ports: ["8081:8080"]（OK）
+	•	外側 Nginx（クライアント→:8080受付→Traefik:8081へ）では Host をそのまま渡す：
+
+location / {
+  proxy_pass http://127.0.0.1:8081;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;               # ← 必須。CVAT_HOSTと一致させる
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection $connection_upgrade;
+
+  # SPAのディープリンク対策（/tasks直打ちで404にしない）
+  error_page 404 = @spa;
+}
+location @spa { proxy_pass http://127.0.0.1:8081; }
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+4) CSRF/CORS/Allowed（いまの設定でOK）
+
+cvat_server の environment に既に入っている
+ALLOWED_HOSTS / (DJANGO_)CSRF_TRUSTED_ORIGINS / (DJANGO_)CORS_ALLOWED_ORIGINS はそのままでOK。
+実際にアクセスする URL（http://10.71.82.54:8080 と http://10.71.82.54） が入っていることだけ確認。
+
+⸻
+
+反映手順
+
+# 1) 変数が正しく展開されるか事前確認
+docker compose config | grep -E "routers\.cvat-(ui|api)\.rule|services\.cvat-(ui|api)\.loadbalancer"
+
+# ここで  Host(`10.71.82.54`) と出ていればOK（localhostなら .env が効いてません）
+
+# 2) 反映
+docker compose up -d traefik cvat_ui cvat_server
+sudo nginx -t && sudo systemctl reload nginx
+
+# 3) 動作確認
+curl -I http://10.71.82.54:8080/                      # 200 (UI)
+curl -I http://10.71.82.54:8080/logo.svg              # 200 (UIの静的)
+curl -i  http://10.71.82.54:8080/api/server/about     # 200 (API)
+
+
+⸻
+
+まだダメな時に見る場所（超ピンポイント）
+	•	labels の展開結果（最重要）：
+docker compose config | sed -n '1,300p' で Host('10.71.82.54') になっているか。
+→ localhost のままなら .env を見ていません。置き場所/スペルを再確認。
+	•	Traefik ログ：
+docker compose logs --tail=200 traefik
+ルーターが有効化されているか、Host mismatch で落ちていないか。
+	•	Nginx が Host を変えてないか：
+proxy_set_header Host $host; が入っているか（localhost 固定はNG）。
+
+⸻
+
+なぜこれで直るの？
+	•	Compose の ${CVAT_HOST} は .env で決まるため、ここが localhost だと Traefik は localhost しか受けない。
+	•	labels を UI/API で分離し、静的アセットは UI(80)、API は 8080 に流すと /logo.svg や /api/... の 404/502 が解消。
+	•	Nginx から Host をそのまま渡すことで Traefik の Host ルールに一致。
+
+⸻
+
+必要なら、docker compose config の該当行の出力を貼ってください（1〜2行でOK）。
+Host('10.71.82.54') に展開されているかだけ見れば、次の一手を秒速で決められます。
+
+
+
