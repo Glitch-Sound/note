@@ -1147,4 +1147,93 @@ http://10.71.82.54:8080 を含める（カンマ区切り、余計な空白に�
 
 
 
+---
+
+結論：そのリクエストは Traefik を通らず、cvat_server に “直接” 送られています。
+Django の
+
+Invalid HTTP_HOST header: 'cvat-server:8080'
+
+は、バックエンドが Host: cvat-server:8080 というヘッダを受け取った証拠です。
+Traefik のルータは Host(10.71.82.54) 条件なので、その Host では本来 バックエンドに届きません（404になる）。＝ どこかに「cvat_server 直プロキシ」の経路が残っています。
+
+⸻
+
+今すぐの直し方（どちらか1つ）
+
+方式A（推奨）Nginx を Traefik 8081 にだけ転送
+
+Nginx の 8080 サーバーブロックを これだけにしてください（他の proxy_pass を消す）：
+
+server {
+  listen 8080 default_server;
+  server_name 10.71.82.54 _;
+
+  location / {
+    proxy_pass http://127.0.0.1:8081;   # ★ Traefik にだけ中継
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;        # ★ Host を元のまま維持（= 10.71.82.54）
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+
+    error_page 404 = @spa;              # SPA の深いパス対策
+  }
+  location @spa { proxy_pass http://127.0.0.1:8081; }
+}
+
+反映：
+
+sudo nginx -t && sudo systemctl reload nginx
+
+方式B（暫定回避）直プロキシのまま許可する
+
+どうしても proxy_pass http://cvat-server:8080; を残すなら、cvat_server の環境変数に ALLOWED_HOSTS を追加し cvat-server を許可します：
+
+services:
+  cvat_server:
+    environment:
+      ALLOWED_HOSTS: "10.71.82.54, localhost, cvat-server"
+      DJANGO_CSRF_TRUSTED_ORIGINS: "http://10.71.82.54:8080"
+      DJANGO_CORS_ALLOWED_ORIGINS: "http://10.71.82.54:8080"
+
+その後：docker compose up -d cvat_server
+※動きますが、Traefik をバイパスする経路が残るので A が本筋です。
+
+⸻
+
+すぐ確認するコマンド（コピペ）
+	1.	Nginx を一旦止めて “直アクセスが直るか” を確認（バイパスの有無を判定）
+
+sudo systemctl stop nginx
+curl -i http://10.71.82.54:8080/                 # 200 になるはず
+curl -i http://10.71.82.54:8080/api/server/about # 200 になるはず
+
+ここで 200 になるなら、犯人は Nginx の直プロキシで確定です。A の設定に置き換えてください。
+	2.	Nginx 稼働時にどこへ中継しているかを確認
+
+grep -Rni 'proxy_pass' /etc/nginx
+# cvat-server:8080 に向けている location が見つかるはず → 削除 or Traefik 8081 に変更
+
+
+⸻
+
+念のため
+	•	.env は compose と同じディレクトリに置き、CVAT_HOST=10.71.82.54。
+docker compose config | grep -E "routers\.cvat-(ui|api)\.rule" で Host(‘10.71.82.54’) と展開されていること。
+	•	CSRF/CORS は http://10.71.82.54:8080 を入れておくのが安全：
+
+DJANGO_CSRF_TRUSTED_ORIGINS: "http://10.71.82.54:8080"
+DJANGO_CORS_ALLOWED_ORIGINS: "http://10.71.82.54:8080"
+
+
+
+⸻
+
+これで “Cannot connect to the server” と DisallowedHost の両方が消えるはずです。
+もし続く場合は、Nginx の該当 server ブロック全文と /var/log/nginx/error.log の末尾50行だけ貼ってください。ピンポイントで次を出します。
+
+
+
+
 
