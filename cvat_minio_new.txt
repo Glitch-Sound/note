@@ -358,3 +358,106 @@ curl -i  http://127.0.0.1:8081/api/server/about
 	•	解決：CVAT_HOST を実アクセス名に合わせる（A）、または Nginx で proxy_set_header Host … を上書き（B）。
 	•	SPA の /tasks 直叩きに備え、エラーページ→@spa のフォールバックも忘れずに。
 
+
+
+
+
+
+
+---
+
+原因は2つに整理できます。
+
+A) CSRF の拒否（添付のダイアログ）
+
+Django 側が “このオリジン（http://10.71.82.54:8080）が信頼されていない” と判断しています。
+cvat_server コンテナの環境変数に「許可ホスト／CSRF許可オリジン」を追加して再起動してください。
+
+# docker-compose.yml (server サービスの environment に追記)
+services:
+  cvat_server:
+    environment:
+      CVAT_HOST: 10.71.82.54
+      # どれか1つではなく、使う可能性のあるホスト/ポート/スキームを全部入れる
+      ALLOWED_HOSTS: 10.71.82.54, localhost
+      CSRF_TRUSTED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54, http://localhost:8080
+      CORS_ALLOWED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54, http://localhost:8080
+      # ↑ CVAT のビルドによっては DJANGO_* / CVAT_* のどちらを読むので、どちらも入れてOK
+      DJANGO_ALLOWED_HOSTS: 10.71.82.54, localhost
+      DJANGO_CSRF_TRUSTED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54, http://localhost:8080
+      DJANGO_CORS_ALLOWED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54, http://localhost:8080
+
+反映:
+
+docker compose up -d
+
+https にする予定があるなら https://... も同様に追加してください。
+もし 8080 のリバプロではなく 80 で出すなら http://10.71.82.54 も必須です。
+
+⸻
+
+B) ロゴ等の 404（静的アセット）
+
+多くは Host ヘッダやプロキシ設定の揺れが原因です。最低限、外側 Nginx を次の形にします（CVAT/Traefik を 8081 で公開させている例）:
+
+server {
+  listen 8080 default_server;
+  server_name 10.71.82.54 _;
+
+  location / {
+    proxy_pass http://127.0.0.1:8081;   # ← CVAT(traefik) の公開ポート
+    proxy_http_version 1.1;
+
+    # Host をそのまま渡す（または CVAT_HOST に合わせて固定）
+    proxy_set_header Host $host;        # ← 重要
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    # SPAのディープリンクで 404 にならないようフォールバック
+    error_page 404 = @spa;
+  }
+
+  location @spa {
+    proxy_pass http://127.0.0.1:8081;
+  }
+}
+
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+以前 404/502 が出ていたのは、Host 不一致や 誤った upstream/ポートが主因でした。
+proxy_set_header Host $host; を外すと、静的ファイルだけ 404 になることがよくあります。
+
+⸻
+
+動作確認（順番に）
+	1.	Host ルール一致の確認
+
+curl -I http://10.71.82.54:8080/
+curl -I -H "Host: 10.71.82.54" http://10.71.82.54:8080/
+
+どちらも 200 になること。
+
+	2.	API 応答
+
+curl -i http://10.71.82.54:8080/api/server/about
+
+
+	3.	CSRF 通過（UI から Cloud Storage を更新）
+まだ CSRF が出る場合は、CSRF_TRUSTED_ORIGINS に 実際にアクセスするすべての URL（スキーム＋ホスト＋必要ならポート） を漏れなく追加してください。
+
+⸻
+
+これでもロゴが 404 の場合
+	•	ブラウザのキャッシュを削除してハードリロード（Ctrl+F5 / Cmd+Shift+R）。
+	•	Nginx の他ロケーション（/static/ など）でローカルを参照していないか確認（上の最小構成に戻す）。
+	•	Traefik のログで 404 が出ていないか確認：docker compose logs --tail=200 traefik
+
+ここまで揃えば、CSRF の更新失敗と 一部 404 は解消できるはずです。
+必要なら、いま使っている docker-compose.yml（traefik のラベルと server の environment 周り）と Nginx の server ブロックを貼ってくれれば、差分だけ書いて仕上げます。
+
+
+
+
+
