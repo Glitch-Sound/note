@@ -1073,6 +1073,129 @@ systemctl daemon-reload && systemctl restart docker
 
 
 
+---
+
+
+進捗共有ありがとう。状況を整理すると：
+	•	Cloud storage（S3）経由は、社内の透過プロキシに止められている（＝Deny…）。
+	•	なので今は **「Connected file share（サーバ側共有）」**で回避する方針にしてOK。
+
+「フォルダは見えるが、ファイルが表示されない」件は、仕様どおりの可能性が高いです。
+CVAT の「Connected file share」はファイル一覧は出さず、ディレクトリ単位で選択→中の対応ファイルを一括取込します。
+＝ フォルダを選んで「Select / 追加」→そのまま作成で OK（動画/画像は自動で取り込まれます）。
+
+⸻
+
+まずは“ファイルが読める状態”を確実にする
+
+あなたの MinIO 設定（bitnami/minio）自体は概ねOKです👌
+追加すると良いのはこの2点だけ：
+	•	MINIO_REGION_NAME=us-east-1（S3互換で地域未指定の警告を避ける）
+	•	healthcheck を付ける（依存関係が安定）
+
+minio:
+  image: docker.io/bitnami/minio:2022
+  container_name: ai-pf_minio
+  ports:
+    - "9900:9000"     # S3 API
+    - "9901:9001"     # Console
+  networks:
+    cvat:
+      aliases:
+        - minio       # CVAT からは http://minio:9000
+        - s3
+  environment:
+    MINIO_ROOT_USER: admin
+    MINIO_ROOT_PASSWORD: password
+    MINIO_DEFAULT_BUCKETS: ai-pf
+    MINIO_REGION_NAME: us-east-1
+    MINIO_BROWSER_REDIRECT_URL: http://10.71.82.54:9901
+  volumes:
+    - minio_data:/data
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+    interval: 10s
+    timeout: 3s
+    retries: 15
+
+CVAT から“MinIOの中身”を見せる方法（どちらか1つ）
+
+方法1：MinIOのデータボリュームを CVAT に読み取り専用でマウント（最短）
+
+volumes:
+  minio_data: {}
+  cvat_share: {}
+
+services:
+  cvat_server:
+    # 既存設定に追加
+    environment:
+      CVAT_SHARE_URL: "http://localhost:8080/share"
+    volumes:
+      - cvat_share:/home/django/share
+      - minio_data:/home/django/share/minio:ro   # ← ここがポイント
+    networks:
+      - cvat
+
+  minio:
+    # 上記のとおり
+    volumes:
+      - minio_data:/data
+    networks:
+      - cvat
+
+networks:
+  cvat: {}
+
+→ CVAT 側の「Connected file share」で /home/django/share/minio/ai-pf を選択すれば、バケット ai-pf の中身を取り込めます。
+
+方法2：mc mirror でホスト側に同期してから読む（堅い）
+（前のメッセージで出した案。MinIO→/srv/cvat-share/ai-pf に常時同期して、そこを /home/django/share/ai-pf にマウント）
+
+⸻
+
+UI操作のコツ（“ファイルが見えない”対策）
+	1.	「Create task」→ Connected file share を選択
+	2.	左のツリーで フォルダだけが表示されます（仕様）
+	•	例：/home/django/share/minio/ai-pf をクリック
+	3.	右上の「Select」や「Add」を押してタスクに追加
+	4.	そのまま「Submit」
+	•	取込対象は 画像（jpg/png/bmp/tif…）や動画（mp4/avi/mkv/mov…）の拡張子です
+	•	必要ならフィルタに *.mp4 などを指定
+
+取込中/直後のログで確認：
+docker compose logs -f cvat_server | egrep -i "server files|import|found|error"
+「Found N files」的なメッセージが出ます。
+
+⸻
+
+うまく入らない時のチェック
+	•	権限：マウントしたパスの権限が読めるか
+
+docker exec -it cvat_server bash -lc '
+  id; ls -l /home/django/share/minio/ai-pf | head -20'
+'
+# 読み取り不可ならホスト側で chmod -R a+rX を実施
+
+
+	•	実ファイル確認：中に実際のファイルがあるか
+
+docker exec -it cvat_server bash -lc \
+  'find /home/django/share/minio/ai-pf -maxdepth 2 -type f | head'
+
+
+	•	拡張子：*.mp4 等の対応拡張子であること。
+以前のオブジェクト一覧に r_zoom.syn がありましたが、こういった 非対応拡張子は無視されます。*_0.mp4 は取り込めるはず。
+
+⸻
+
+まとめ
+	•	Connected file share は“フォルダ選択式”でファイルは一覧されません（正常）。
+	•	MinIO の設定は概ねOK。MINIO_REGION_NAME 追加・healthcheck 付与を推奨。
+	•	minio_data を CVAT に :ro でマウントして、/home/django/share/minio/ai-pf を選べば最短で取り込めます。
+	•	それでも拾えない場合は、上の権限/実ファイル/拡張子の3点をチェックしてみてください。
+
+この差分で動くはず。必要ならあなたの compose 全体に合わせて最小差分パッチ（コピペ即反映）にして渡します。
 
 
 
