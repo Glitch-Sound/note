@@ -1049,3 +1049,102 @@ docker compose config | grep "routers\.cvat-.*\.rule" で Host(10.71.82.54) と�
 
 
 
+
+---
+
+いいね、材料そろってます。
+結論から：HTTP ルーティングは通っています（curl 3本すべて 200）。
+つまり「Cannot connect to the server」はブラウザ→API 呼び出し時だけ失敗している状態です（UI は出る、API を fetch すると何かで落ちる）。
+
+下の順で“どこで落ちているか”を 1 分で確定できます。必要なところだけ実行してください。
+
+⸻
+
+0) まず事実の整理（あなたの現状）
+	•	curl -i http://10.71.82.54:8080/ → 200（UI）
+	•	curl -i http://10.71.82.54:8080/logo.svg → 200（静的）
+	•	curl -i http://10.71.82.54:8080/api/server/about → 200（API）
+→ ネットワーク/Traefik 側はOK。残るは**ブラウザ側の要求条件（Origin/Host/ポート/ヘッダ/キャッシュ）**です。
+
+⸻
+
+1) ブラウザから直接 API を開く（即答を得る）
+
+ブラウザのアドレスバーに以下を直接入力して表示を確認：
+
+http://10.71.82.54:8080/api/server/about
+
+	•	これで JSON が見えれば、ブラウザ→APIは到達できています。
+→ 「Cannot connect」はUI 内の最初の API 呼び出し（例：/api/auth/rules）で落ちている可能性が高いので次へ。
+	•	もしここが 403/404/502 なら、そのステータスと本文がそのまま答えです（貼ってください）。
+
+⸻
+
+2) Network タブで“赤いリクエスト”を 1 本だけ見る
+
+ブラウザの DevTools → Network（更新してから /api/ でフィルタ）
+	•	失敗している最初のリクエスト（多くは /api/auth/rules か /api/server/about）をクリック。
+Status / Request URL / Response body の3点だけを見てください。
+
+出やすい 3 パターンと即 fix
+	1.	403 + “CSRF Failed: Origin checking failed”
+→ cvat_server の env で DJANGO_CSRF_TRUSTED_ORIGINS に
+http://10.71.82.54:8080 を 含める（既に入っているならスペルと空白を再確認）。
+変更後：docker compose up -d cvat_server
+	2.	404（from Traefik）（Response Headers に Traefik）
+→ ブラウザでアクセスしている ホスト名が 10.71.82.54 以外（例：PC名や localhost）になっていないか確認。
+Traefik の rule は Host(\${CVAT_HOST}`)なので、**URL は必ずhttp://10.71.82.54:8080** で開く。   どうしてもホスト名で開くなら .envのCVAT_HOST` をそのホスト名に変更。
+	3.	400 / 502（Uvicorn 由来や Bad Gateway）
+→ 400: 以前出ていた Invalid HTTP HOST header: cvat-server:8080 の場合は Nginx 経由ミスですが、いまは Nginx を外しているので再発しないはず。
+→ 502: 一時的にサービスが再起動中の可能性。docker compose logs --tail=100 cvat_server を確認。
+
+⸻
+
+3) “それでも UI だけ”が Cannot connect のとき（よくある2つ）
+	•	ブラウザキャッシュ
+旧バージョンの UI ファイルをキャッシュしていると、古い API パスを叩いて落ちます。
+→ シークレットウィンドウで開く / 強制更新（Ctrl+F5） / キャッシュ削除で解消するケースが多いです。
+	•	CVAT_BASE_URL がズレ
+cvat_server の env に（未設定なら）明示しておくと安全：
+
+CVAT_BASE_URL: http://10.71.82.54:8080
+
+設定後 docker compose up -d cvat_server。
+（レスポンスの絶対URL生成に使われるため、まれにここが効きます）
+
+⸻
+
+4) 念のための自己診断 3 コマンド（コピペ可）
+
+# ルールが本当に “10.71.82.54” に展開されているか
+docker compose config | grep -E "routers\.cvat-(ui|api)\.rule"
+
+# UI から参照する2エンドポイントのヘッダ（Origin 模倣）
+curl -i -H "Origin: http://10.71.82.54:8080" http://10.71.82.54:8080/api/server/about
+curl -i -H "Origin: http://10.71.82.54:8080" http://10.71.82.54:8080/api/auth/rules
+
+	•	auth/rules が 200 なら UI 初期化はまず通ります。ここだけ 403 なら CSRF_TRUSTED_ORIGINS の漏れです。
+
+⸻
+
+5) どう修正すればよいか（最小セット）
+	•	アクセス URL は 必ず http://10.71.82.54:8080（CVAT_HOST=10.71.82.54 に一致）
+	•	DJANGO_CSRF_TRUSTED_ORIGINS / DJANGO_CORS_ALLOWED_ORIGINS に
+http://10.71.82.54:8080 を含める（カンマ区切り、余計な空白に注意）
+	•	（必要なら）CVAT_BASE_URL: http://10.71.82.54:8080 を追加
+	•	反映：docker compose up -d cvat_server
+	•	ブラウザはシークレットウィンドウで再テスト
+
+⸻
+
+まだ NG の場合に教えてほしい最小情報
+	•	Network タブで失敗している 1 本の Request URL / Status / Response body
+	•	docker compose logs --tail=100 cvat_server の末尾だけ
+
+それで “Cannot connect” の正体を1発で特定します。
+
+
+
+
+
+
