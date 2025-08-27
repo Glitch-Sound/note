@@ -785,3 +785,114 @@ sudo ufw status verbose || true
 
 
 
+
+
+---
+
+原因の切り分けポイントはもう3つだけです。いまは 8080 が「拒否」なので “そのポートを誰も listen していない” のが直近の原因です。最短復旧の手順を2通り置きます。どちらかをそのまま実行してください。
+
+⸻
+
+A. いったん Nginx を飛ばして Traefik を 8080 に直公開（最速）
+	1.	Traefik をホストの 8080 へ公開するように変更
+docker-compose.yml の traefik サービス:
+
+services:
+  traefik:
+    image: traefik:v3.3
+    ports:
+      - "8080:8080"   # ★ 8081:8080 を 8080:8080 に変更
+      - "8090:8090"
+    # （既存の command/labels はそのままでOK。--providers.docker と --entrypoints.web=:8080 が必要）
+
+もしホスト側の 8080 を Nginx が使っているなら、先に
+sudo systemctl stop nginx してから進めてください（後で戻せます）。
+
+	2.	再起動
+
+docker compose up -d traefik
+docker compose up -d cvat_ui cvat_server
+
+	3.	CVAT_HOST の展開を確認（ここが “localhost” だとルーティングされません）
+
+docker compose config | grep -E "routers\.cvat-(ui|api)\.rule"
+# 期待: Host(`10.71.82.54`) のように “実IP/実ホスト名” が見える
+
+	4.	動作確認
+
+curl -i http://10.71.82.54:8080/                 # 200 (UI)
+curl -i http://10.71.82.54:8080/logo.svg         # 200 (静的)
+curl -i http://10.71.82.54:8080/api/server/about # 200 (API)
+
+
+⸻
+
+B. Nginx をフロントに残す（8080→Traefik 8081）
+
+8080 を Nginx が受けて、Traefik の 8081 に中継する方式です。
+現状の “Connection refused” は Nginx が 8080 を listen していない/停止中 が濃厚です。
+
+	1.	Nginx の vhost を最小形で用意（/etc/nginx/conf.d/cvat.conf 等）
+
+server {
+  listen 8080 default_server;
+  server_name 10.71.82.54 _;
+
+  location / {
+    proxy_pass http://127.0.0.1:8081;   # Traefik の公開ポート
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;        # ← Traefik の Host ルールに必須
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    # SPA ディープリンク対策
+    error_page 404 = @spa;
+  }
+  location @spa { proxy_pass http://127.0.0.1:8081; }
+}
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+	2.	Nginx を起動/再読込
+
+sudo nginx -t && sudo systemctl restart nginx
+
+	3.	疎通
+
+curl -i http://127.0.0.1:8080/
+
+まだ拒否なら sudo ss -lntp | egrep '(:8080|:8081)' で どのプロセスがどのポートを listen しているか確認してください。8080 を Nginx が、8081 を Traefik が listen していればOKです。
+
+⸻
+
+重要な確認（両方式共通）
+	•	.env に CVAT_HOST を必ず置く
+CVAT_HOST=10.71.82.54（実際にブラウザでアクセスするホスト名/IP）
+→ docker compose config の表示が Host(10.71.82.54) になること。
+	•	Traefik のコマンドがあること
+--providers.docker=true と --entrypoints.web.address=:8080 の指定が必要です（公式 compose には入っています）。
+もし未設定なら traefik サービスに command: を追加してください。
+	•	UI/API のルータ分離はOK（あなたのスクショ通りで良い）
+	•	cvat-ui: Host(${CVAT_HOST}) → port 80
+	•	cvat-api: Host(${CVAT_HOST}) && PathPrefix(/api|/admin|/static|/django-rq) → port 8080
+
+⸻
+
+うまくいかないときに貼ってほしい最小ログ
+
+sudo ss -lntp | egrep '(:8080|:8081)'
+docker compose ps
+docker compose logs --tail=100 traefik
+docker compose logs --tail=100 cvat_ui
+docker compose logs --tail=100 cvat_server
+docker compose config | grep -E "routers\.cvat-(ui|api)\.rule|services\.cvat-(ui|api)\.loadbalancer"
+
+この順で実施すれば、「8080 が拒否」→「UI/API 404/CSRF」まで一気にクリアできます。まずは A案（Traefik を 8080 に直公開） で通るかを確認するのがいちばん速いです。
+
+
+
+
+
+
+
