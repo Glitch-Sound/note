@@ -942,3 +942,138 @@ C. 恒久対策（可能なら）
 
 
 
+
+
+---
+
+
+なるほど、「Deny: Not Global Unicast」に切り替わった＝依然として CVAT 側の外向き通信が透過プロキシ／egress フィルタに捕まっている状況です。
+（宛先が minio:9000 のときは Private Range、localhost:9000 にすると Not Global Unicast と判定され続けています）
+
+このタイプは NO_PROXY だけでは回避できません。CVAT → MinIO の直接通信をやめるか、プロキシ側で除外を入れてもらうの二択になります。すぐ動かすための実装案と、恒久対応の依頼事項をまとめます。
+
+⸻
+
+すぐ動かす回避策（CVAT は MinIO に触れない）
+
+A) 「共有ファイルシステム」で運用する（最短・確実）
+
+MinIO のバケット内容を ホストのディレクトリに同期し、そのディレクトリを CVAT の“Shared File System”としてマウントします。
+→ CVAT はローカルファイルを読むだけなので、プロキシに一切触れません。
+
+compose 追記例
+
+volumes:
+  cvat-share: {}        # 既にあれば流用
+  minio-data: {}        # 既にあれば流用
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  # MinIO → ホストディレクトリへ常時同期
+  minio_mirror:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+    volumes:
+      - /srv/cvat-share/ai-pf:/shared/ai-pf    # ←ホスト側の実ディレクトリ
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set m http://minio:9000 admin password &&
+      mc mb -p m/ai-pf || true &&
+      mc mirror --overwrite --watch m/ai-pf /shared/ai-pf
+      "
+
+  cvat_server:
+    # …既存定義…
+    environment:
+      # 代理店の介入を避けるため一応残す（効果があればラッキー）
+      http_proxy: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: "localhost,127.0.0.1,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      no_proxy: "localhost,127.0.0.1,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      CVAT_SHARE_URL: "http://localhost:8080/share"
+    volumes:
+      - cvat-share:/home/django/share
+      - /srv/cvat-share/ai-pf:/home/django/share/ai-pf:ro  # ←同期ディレクトリを読み取り専用でマウント
+
+CVAT 側の操作
+	•	Cloud Storage は 「Shared File System」 を選択
+	•	Path: /home/django/share/ai-pf
+	•	Read-only でも可
+	•	以後、MinIO バケットに置いたファイルは自動で /home/django/share/ai-pf に反映され、CVAT から参照できます。
+
+これで CVAT⇔MinIO のネットワーク通信はゼロ。透明プロキシの影響を完全に回避します。
+
+⸻
+
+B)（代替）一時的に“Import/Export 専用ジョブ”で同期
+
+上の常時同期が重い場合は、mc mirror を **手動（ワンショット）**で走らせてもOKです：
+
+docker run --rm --network <cvatのネットワーク> \
+  -v /srv/cvat-share/ai-pf:/shared \
+  minio/mc sh -lc "
+  mc alias set m http://minio:9000 admin password &&
+  mc mirror --overwrite m/ai-pf /shared"
+
+必要な時だけ同期 → CVAT では常に Shared File System を参照。
+
+⸻
+
+恒久対応（S3直結を再開したい場合）
+
+ネットワーク管理側に CVAT サーバー用の除外ルール を依頼してください。要点だけ箇条書きします：
+	•	透過 HTTP プロキシ／egress フィルタで
+	•	宛先が Docker ブリッジ帯（172.16.0.0/12, 192.168.0.0/16）および 127.0.0.1 の通信を許可
+	•	もしくは cvat_server コンテナ（ホスト名/プロセス）を除外
+	•	具体例として以下を許可対象に：
+	•	宛先ホスト: minio（Docker 内の名前解決）
+	•	宛先IP: MinIO コンテナのブリッジ IP（例: 192.168.128.0/24 など）
+	•	宛先ポート: 9000（S3 API）
+	•	可能なら Docker デーモンのプロキシ伝播を無効化
+	•	/etc/systemd/system/docker.service.d/http-proxy.conf を確認し、HTTP_PROXY/HTTPS_PROXY を外して
+systemctl daemon-reload && systemctl restart docker
+
+この許可が入れば、CVAT の Cloud Storage を AWS S3 / Endpoint: http://minio:9000 / Bucket: ai-pf で再登録すれば直に使えます。
+
+⸻
+
+追加の念押しチェック
+	•	docker exec -it cvat_server env | grep -i proxy
+→ HTTP*_PROXY は空、NO_PROXY だけ残っていればOK
+	•	docker exec -it cvat_server sh -lc "curl -s -o /dev/null -w '%{http_code}\n' http://minio:9000/minio/health/ready"
+→ ここが 200 でも プロキシが途中で横取りしているケースがある（今回がそれ）。
+→ その場合は**上の“Shared File System 方式”**で作業を進めるのが最短です。
+
+⸻
+
+まとめ
+	•	今の「Deny: …」は透過プロキシが容赦なく遮断しているサイン。
+	•	CVAT⇔MinIO の直接通信をやめ、Shared File System + mc mirror で回避するのが即効です。
+	•	恒久対応はネットワーク側の除外が必要。
+
+上の compose 追記でまず A 案を入れてみてください。/srv/cvat-share/ai-pf にファイルが同期され、CVAT の「Shared File System」から見えれば成功です。もし必要なら、あなたの現在の docker-compose.yml に合わせた最小差分を書いて渡します。
+
+
+
+
+
+
+
+
