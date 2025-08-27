@@ -250,6 +250,96 @@ timedatectl でNTPが有効か確認。大きくずれていると S3 認証に�
 
 
 
+---
+
+
+
+Use path-style addressing: ON（超重要）
+Use HTTPS: OFF（httpのままなら）
+
+上記設定は存在しないため設定不可となる
+
+
+また、minioの箇所はコンテナ名とのことなので、ai-pf_minioにしたら以下エラーが発生した
+
+Could not create the cloud storage
+Invalid endpoint: http://ai-pf_minio:9000
+
+
+
+---
+
+
+
+了解、ここはポイントを絞って直します。
+
+結論（まず抑える2点）
+	1.	エンドポイントにアンダースコアはNG
+http://ai-pf_minio:9000 は 無効なホスト名 です（URLのホスト部に _ は使えません）。
+→ 使うなら http://minio:9000（サービス名）か http://<UbuntuのIP>:9000 を指定してください。
+	2.	“Use path-style/HTTPS” トグルが見当たらなくてもOK
+CVATの一部バージョンではUIにそのトグルが出ないことがありますが、http://... を指定していれば HTTPSは自動でOFF、また 非AWSの独自エンドポイント（minio:9000 など）の場合は 内部的に path-style が選ばれる（auto判定） ため、明示できなくても接続できます。
+エラーの主因は バケット未作成/権限/到達性 にあることがほとんどです。
+
+⸻
+
+直し方（最短チェックリスト）
+
+0) Compose ネットワーク確認
+
+CVAT と MinIO を 同じ docker network に置く（同一 compose ファイルなら自動で同ネットワーク）。
+別 compose の場合は networks: で同じネットワークに参加させるか、Endpoint を http://<UbuntuのIP>:9000 にしてください。
+
+1) MinIO バケットの存在を保証
+
+MinIOコンソール（http://<UbuntuのIP>:9001）で ai-pf が存在するか確認。無ければ作成。
+（自動作成したい場合は minio/mc で mc mb -p local/ai-pf を走らせる）
+
+2) CVAT→MinIO の疎通
+
+# CVATサーバの中から MinIO のヘルスに届くか
+docker exec -it <cvat_serverのコンテナ名> \
+  curl -s -o /dev/null -w "%{http_code}\n" http://minio:9000/minio/health/ready
+# 200 が返ればOK
+
+3) 資格情報の正しさを確定（S3 APIで事前テスト）
+
+# 同ネットワークで一時コンテナから S3 API を叩いてバケットを一覧
+docker run --rm --network <composeのネットワーク名> \
+  -e AWS_ACCESS_KEY_ID=admin \
+  -e AWS_SECRET_ACCESS_KEY=password \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli s3 ls --endpoint-url http://minio:9000 s3://ai-pf
+# ここでエラーが出るなら、鍵 or バケット or 到達性の問題
+
+4) CVAT の Cloud Storage 画面の値
+	•	Provider: AWS S3
+	•	Bucket name: ai-pf（存在必須）
+	•	Authentication type: Key ID / Secret
+	•	Access key ID: admin
+	•	Secret access key: password
+	•	Endpoint URL: http://minio:9000（または http://<UbuntuのIP>:9000）
+	•	Region（項目があれば）: us-east-1
+
+これで失敗する場合は、CVATサーバのログに原因が必ず出ます：
+docker compose logs -f cvat_server | egrep -i "s3|minio|error|bucket"
+
+⸻
+
+よくあるハマりどころと対処
+	•	ai-pf_minio を使う → URLホストに _ は使えず 無効。minio か IP を使う。
+	•	別composeで立てている → 名前解決できず失敗。同ネットワークに参加させるか IP:9000 を使う。
+	•	時刻ズレ → 署名エラーの原因。timedatectl でNTP同期をONに。
+	•	バケット未作成 → CVAT側エラー文が「resource not found」になりがち。先に作る。
+	•	UFW → 別PCから検証する時は 9000/9001 を allow。ローカル内連携には不要。
+
+⸻
+
+必要なら、あなたの現在の docker-compose.yml に合わせて 最小差分パッチ（ネットワーク共有＋MinIO初期化＋動作確認用ワンライナー付き）を書いて渡します。今の compose の services: と networks: の部分を貼ってくれれば、こちらで“そのまま置き換え”できる形にします。
+
+
+
+
 
 
 
