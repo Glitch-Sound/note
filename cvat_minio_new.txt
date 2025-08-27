@@ -895,4 +895,76 @@ docker compose config | grep -E "routers\.cvat-(ui|api)\.rule|services\.cvat-(ui
 
 
 
+---
+
+ナイス共有！.env の内容自体はOKに見えますが、いまの “8080: Connection refused” は、そもそも 8080 を誰も listen していないのが原因です。加えて、.env が compose に読み込まれていない可能性も高いので、次の順でサクッと確認してください。
+
+⸻
+
+1) .env が本当に読まれているか確認
+
+.env は docker-compose.yml と同じディレクトリに置く必要があります（他の場所にあると無視されます）。そして値は スペース無しで CVAT_HOST=10.71.82.54。
+
+読み込み確認（出力に Host('10.71.82.54') が出れば合格）:
+
+cd /path/to/compose_dir   # ← docker-compose.yml がある場所
+docker compose config | grep -E "routers\.cvat-(ui|api)\.rule|services\.cvat-(ui|api)\.loadbalancer"
+
+	•	Host('localhost') になっていたら、.env が効いていません。
+→ .env を compose と同じフォルダに移すか、起動時に --env-file /path/to/.env を付けてください。
+
+⸻
+
+2) まずは Traefik を 8080 に直公開（最速で緑にする）
+
+Nginx をいったん外して、Traefik を 8080 に出します。
+
+# services.traefik の ports
+ports:
+  - "8080:8080"   # ← 今は 8081:8080 だったはず。8080:8080 に変更
+  - "8090:8090"
+
+反映:
+
+docker compose up -d traefik cvat_ui cvat_server
+
+疎通:
+
+curl -i http://10.71.82.54:8080/                 # 200 期待（UI）
+curl -i http://10.71.82.54:8080/logo.svg         # 200 期待（静的）
+curl -i http://10.71.82.54:8080/api/server/about # 200 期待（API）
+
+まだ拒否なら、ホストで誰がどのポートを listen してるか確認：
+
+sudo ss -lntp | egrep '(:8080|:8081)'
+docker compose ps
+docker compose logs --tail=100 traefik cvat_ui cvat_server
+
+
+⸻
+
+3) フロントに Nginx を使うなら（後戻し用）
+
+Traefik を 8081 に戻し、Nginx が 8080 を listen して Traefik:8081 に proxy_pass する形にします（proxy_set_header Host $host; を必ず入れる）。最小例は以前送った Nginx 設定の通り。
+
+⸻
+
+要点まとめ
+	•	.env は compose と同じフォルダに。docker compose config で Host(‘10.71.82.54’) を必ず確認。
+	•	8080 拒否は プロセス未起動 or 別ポート公開が原因。まずは Traefik を 8080 直公開して動作確認が一番早い。
+	•	その後に Nginx をかませるなら、8080 を Nginx が listen、8081 に中継、Host ヘッダ維持。
+
+もしここで引っかかったら、下の3つだけ貼ってください（コピペで可）：
+
+docker compose config | grep -E "routers\.cvat-(ui|api)\.rule"
+sudo ss -lntp | egrep '(:8080|:8081)'
+docker compose logs --tail=100 traefik
+
+これで次の一手をピンポイントで出します。
+
+
+
+
+
+
 
