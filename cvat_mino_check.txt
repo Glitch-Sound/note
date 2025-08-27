@@ -535,6 +535,95 @@ CVAT 側の入力値（再確認）
 
 
 
+---
+
+
+
+おお、スクショの2本とも通ってるね！
+	•	cvat_server から http://minio:9000/minio/health/ready → 200
+	•	aws-cli で s3 ls --endpoint-url http://minio:9000 s3://ai-pf → バケット内オブジェクト表示
+
+＝ 名前解決・疎通・認証・バケット存在はOK です。
+残りの原因は「CVATサーバ（やワーカー）が プロキシ経由に流れてブロック される」か、「UIの入力値ミス」くらいに絞れました。
+
+⸻
+
+次にやること（この順でOK）
+
+1) CVAT側のプロキシを“確実に”無効化
+
+docker-compose.yml（または override）で cvat_server とワーカー系に以下を入れて再起動してください。
+
+services:
+  cvat_server:
+    environment:
+      - http_proxy=
+      - https_proxy=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - NO_PROXY=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - no_proxy=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+
+  cvat_worker_import:
+    environment:
+      - http_proxy=
+      - https_proxy=
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - NO_PROXY=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - no_proxy=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+
+  cvat_worker_export:
+    environment: *同上
+  cvat_worker_annotation:
+    environment: *同上
+
+反映後に docker exec -it cvat_server env | grep -i proxy で空/NO_PROXYになっていることを念のため確認。
+
+2) CVAT の Cloud Storage 画面をこの値で作成
+	•	Provider: AWS S3
+	•	Bucket name: ai-pf
+	•	Authentication: Key/Secret
+	•	Access key / Secret: admin / password（あなたの値）
+	•	Endpoint URL: http://minio:9000
+	•	Region（項目があれば）: us-east-1
+（UIに「Use path-style / Use HTTPS」が無くてもOK。http://... を入れていればHTTP、独自エンドポイントは自動的に path-style になります）
+
+3) まだ失敗する場合のログ確認ワンライナー
+
+docker compose logs -f cvat_server | egrep -i "cloud|s3|minio|bucket|error|proxy|deny"
+
+ここで proxy や Deny: Private Range が見えたら、プロキシ無効化が漏れている箇所があります（上記の環境変数をすべての関連サービスに入れて再起動）。
+
+⸻
+
+UIがダメでも通る“直接API作成”の回避策（そのまま実行可）
+
+# 1) ログイン（クッキー保存）
+curl -c cookies.txt -X POST -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<CVATの管理者パス>"}' \
+  http://<CVATホスト>:8080/api/auth/login
+
+# 2) Cloud Storage 作成
+curl -b cookies.txt -X POST -H "Content-Type: application/json" \
+  -d '{
+    "provider_type": "AWS_S3",
+    "resource": "ai-pf",
+    "endpoint_url": "http://minio:9000",
+    "credentials_type": "KEY_SECRET_KEY",
+    "key_id": "admin",
+    "secret_key": "password",
+    "location": "us-east-1",
+    "visibility": "PRIVATE"
+  }' \
+  http://<CVATホスト>:8080/api/cloudstorages
+
+201 Created が返れば登録成功です。
+
+⸻
+
+ここまでで登録できるはず。次は「クラウドストレージからのインポート／エクスポート」を試す段階なので、worker_import / worker_export にも NO_PROXY を入れておくのがポイントだよ。
+うまくいったかだけ教えて。もしエラーが出たら、上の logs ワンライナーの出力を貼ってくれれば、次の一手をすぐ出すね。
 
 
 
