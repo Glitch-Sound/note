@@ -709,3 +709,79 @@ Host('10.71.82.54') に展開されているかだけ見れば、次の一手を
 
 
 
+
+
+
+---
+
+OK、8080 が “connection refused” なので、まずは「誰が 8080 を聴く想定か（Nginx？Traefik？）」と「実際に聴いてるプロセスがあるか」を最短で切り分けます。
+以下の最小セットだけ共有してくれれば十分解析できます（鍵やドメインは伏字でOK）。
+
+送ってほしい最小セット
+	1.	経路（1行）
+例：Client → Nginx(8080) → Traefik(8081) → [cvat_ui:80, cvat_server:8080]
+	2.	ポートの実リスン状況（ホスト）
+
+sudo ss -lntp | egrep '(:80|:443|:8080|:8081)'
+# 代替: sudo lsof -iTCP:8080 -sTCP:LISTEN -nP
+
+	3.	Nginx の状態 & 該当サーバーブロック
+
+systemctl status nginx --no-pager | sed -n '1,30p'
+sudo nginx -t
+# サイト設定（該当 vhost だけでOK）
+sed -n '1,200p' /etc/nginx/sites-enabled/*.conf
+
+（listen 8080; / proxy_pass / proxy_set_header Host ... あたりが見えれば十分）
+	4.	Docker 側の公開ポートと起動状況
+
+docker compose ps
+docker ps --format 'table {{.Names}}\t{{.Ports}}' | egrep 'traefik|cvat'
+
+	5.	Traefik の公開ポートに直アクセス（ホスト上で）
+
+curl -i http://127.0.0.1:8081/
+curl -i -H "Host: <CVAT_HOST>" http://127.0.0.1:8081/
+curl -i -H "Host: <CVAT_HOST>" http://127.0.0.1:8081/api/server/about
+
+	6.	8080（Nginx）への到達可否（ホスト上で）
+
+curl -i http://127.0.0.1:8080/
+curl -i http://127.0.0.1:8080/api/server/about
+
+	7.	compose の “該当部分だけ”
+	•	traefik サービスの ports:
+	•	cvat_ui の labels:（router ルールと service port）
+	•	cvat_server の labels:（API/静的の PathPrefix ルールと service port）
+	•	cvat_server の environment から この4つだけ
+CVAT_HOST, ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, CORS_ALLOWED_ORIGINS
+※他の環境変数は不要・伏字OK
+	8.	.env の該当行だけ
+
+CVAT_HOST=<現在アクセスに使っているIPかホスト名>
+CVAT_VERSION=...
+
+	9.	直近ログ（各50〜100行でOK）
+
+docker compose logs --tail=100 traefik
+docker compose logs --tail=100 cvat_ui
+docker compose logs --tail=100 cvat_server
+
+	10.	ファイアウォール（有効なら）
+
+sudo ufw status verbose || true
+
+
+⸻
+
+期待する絞り込みポイント
+	•	8080 を Nginx が listen していない → Nginx 停止/設定ミス/別サービスが使用
+	•	Nginx は動いているが 127.0.0.1:8080 のみで listen → 外部からは拒否
+	•	Nginx→Traefik の proxy_pass 先/Host ヘッダ違い
+	•	Traefik が 8081 を公開していない or Host ルールが localhost のまま
+	•	CVAT_HOST が labels に展開されておらず Host 不一致
+
+このセットがあれば、どこで詰まっているかをピンポイントで特定できます。準備できた順に貼ってください！
+
+
+
