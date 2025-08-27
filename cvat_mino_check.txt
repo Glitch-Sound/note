@@ -628,6 +628,100 @@ curl -b cookies.txt -X POST -H "Content-Type: application/json" \
 
 
 
+---
+
+
+
+いいぞ、MinIO 側はもう「名前解決・疎通・認証・バケット存在」まで通ってる 👍
+いまの「Cannot connect to the server」は UI→API の経路が Traefik の Host ルールと噛み合っていない可能性が高いです（＝CVAT_HOST を IP にしたまま http://localhost:8080 を開くと、UIは出るけど API だけルート不一致で落ちる、という典型）。
+
+まず “事実確認” を一発でやりましょう。
+
+1) ルール不一致の切り分け（そのまま実行）
+
+# A: localhost ヘッダで API を叩く（UI からの実際のリクエストと同じ）
+curl -I -H 'Host: localhost' http://127.0.0.1:8080/api/server/about
+
+# B: CVAT_HOST（たぶん 10.71.82.54）ヘッダで API を叩く
+curl -I -H 'Host: 10.71.82.54' http://127.0.0.1:8080/api/server/about
+
+	•	A が 404/502、B が 200 なら Traefik の Host ルールが原因確定 です。
+
+2) 修正パターン（どれか1つ）
+
+パターンA：ルールを“両方マッチ”にする（おすすめ）
+
+cvat_proxy の labels を以下のように広げます（UI と API 両方）。
+
+services:
+  cvat_proxy:
+    # ...（既存設定）
+    labels:
+      - traefik.enable=true
+
+      # API
+      - traefik.http.routers.cvat.entrypoints=http
+      - traefik.http.services.cvat.loadbalancer.server.port=8080
+      - traefik.http.routers.cvat.rule=Host(`${CVAT_HOST}`) || Host(`localhost`) || Host(`127.0.0.1`)
+
+      # UI
+      - traefik.http.routers.cvat-ui.entrypoints=http
+      - traefik.http.services.cvat-ui.loadbalancer.server.port=80
+      - traefik.http.routers.cvat-ui.rule=Host(`${CVAT_UI_HOST:-${CVAT_HOST}}`) || Host(`localhost`) || Host(`127.0.0.1`)
+
+シンプルにしたいなら HostRegexp(\{host:.+}`)` でも可（開発用）。
+
+パターンB：常に IP でアクセスする
+
+http://10.71.82.54:8080 のみ使う（localhostは使わない）。
+※ ただし社内 DNS/FQDN に移行する時は、FQDN を CVAT_HOST に設定。
+
+パターンC：Traefik を介さず動作確認
+
+開発中だけ、UI/API を直公開にしてルーティング問題を外します。
+
+services:
+  cvat_server:
+    ports: ["8081:8080"]   # API
+  cvat_ui:
+    ports: ["8082:80"]     # UI
+# ブラウザ: http://localhost:8082 （UI）→ API は http://localhost:8081 を参照
+
+3) そのほかチェック（サクッと）
+
+docker compose ps             # cvat_proxy / cvat_server / cvat_ui / cvat_opa が Up か
+docker compose logs -f cvat_proxy | egrep -i 'router|cvat|ui|error|404|502'
+docker compose logs -f cvat_server | tail -n 100
+
+	•	cvat_proxy ログに「router not found」系があれば ルール不一致。
+	•	cvat_server が落ちていれば別問題（DB/Redis/OPA）。その場合はそこを直します。
+
+4) NO_PROXY はそのままでOK
+
+スクショでは NO_PROXY/no_proxy をワーカーに入れてますが、cvat_server にも入れるのを忘れずに。
+（すでに MinIO 疎通が通っているので設定自体は正しく効いています）
+
+environment:
+  - http_proxy=
+  - https_proxy=
+  - HTTP_PROXY=
+  - HTTPS_PROXY=
+  - NO_PROXY=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+  - no_proxy=localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+
+
+⸻
+
+まとめ
+	•	いまの症状は Traefik の Host ルールが本命。
+	•	上の curl 2本で確定 → ラベルを localhost もマッチさせればすぐ直ります。
+	•	どうしても噛み合わなければ、一時的に 直公開（パターンC） で作業を進めてもOK。
+
+実行結果（curl の A/B）だけ教えてくれれば、あなたの compose に合わせた 最小差分を書いて返すよ。
+
+
+
+
 
 
 
