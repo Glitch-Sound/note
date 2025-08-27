@@ -721,6 +721,134 @@ environment:
 
 
 
+---
+
+
+
+スクショのログで決め手はここ👇
+decision_reason: "Deny: Private Range" , requested_host: "minio:9000"
+＝ CVATのリクエストが “HTTPプロキシ経由” に流れていて、プライベートIP宛が遮断 されています。
+その結果、MinIO へ直で行けず ⇒ The resource ai-pf not found まで連鎖しています。
+
+やることはシンプルで、cvat_server を含む “バックエンド系コンテナ” 全部で proxy を完全に無効化 です。
+（先に cvat_worker_consensus に NO_PROXY を入れてくれたけど、cvat_server 本体にも入れてください。上書き漏れがあると、今のログのように再発します）
+
+⸻
+
+① compose に「プロキシ無効化アンカー」を作って全適用
+
+# docker-compose.yml（または override） の先頭付近に追記
+x-noproxy: &noproxy
+  http_proxy: ""
+  https_proxy: ""
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  # Docker内通信と社内プライベート帯はプロキシを通さない
+  NO_PROXY: "localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  no_proxy: "localhost,127.0.0.1,minio,*.local,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+services:
+  cvat_server:
+    # 既存設定に追加
+    environment:
+      <<: *noproxy
+    depends_on:
+      - minio
+  cvat_worker_import:
+    environment: { <<: *noproxy }
+  cvat_worker_export:
+    environment: { <<: *noproxy }
+  cvat_worker_annotation:
+    environment: { <<: *noproxy }
+  cvat_worker_quality_reports:
+    environment: { <<: *noproxy }
+  cvat_worker_consensus:
+    environment: { <<: *noproxy }
+  # MinIO はそのままでOK（同ネットワークに）
+
+重要：
+	•	*backend-env のようなアンカーが他にある場合、そこ経由で proxy が再注入されないよう、この <<: *noproxy を 後ろ に置いて上書きしてください。
+	•	.env に HTTP_PROXY 等があるなら削除。ホスト環境変数も Compose に流れます。
+
+反映：
+
+docker compose up -d
+
+
+⸻
+
+② “本当に無効化されたか” を確認（超重要）
+
+# プロキシ環境変数が残っていないか
+docker exec -it cvat_server env | grep -i proxy
+
+# ← 何も出ない or NO_PROXY/no_proxy のみ表示になっていればOK
+
+# CVATサーバから MinIO に直で届くか（再確認）
+docker exec -it cvat_server sh -lc \
+  "getent hosts minio; curl -s -o /dev/null -w '%{http_code}\n' http://minio:9000/minio/health/ready"
+# ← 名前解決結果が出て、200 が返ればOK
+
+もしここで CANONICAL-PROXY-DECISION っぽいログが再び出るなら、まだどこかで proxy が効いています（アンカー上書き位置や env_file を再確認）。
+
+⸻
+
+③ CVAT の Cloud Storage 登録値（再掲・最小構成）
+	•	Provider: AWS S3
+	•	Bucket: ai-pf（MinIOで事前作成済み）
+	•	Access key / Secret: admin / password（あなたの値）
+	•	Endpoint URL: http://minio:9000（同一ネットワーク前提）
+	•	Region（あれば）: us-east-1
+
+UI に Use path-style や Use HTTPS のトグルが見えなくてもOK。http://... を入れていれば HTTP で、独自エンドポイントは自動で path-style が使われます。
+
+⸻
+
+④ まだダメなときの最短デバッグ
+
+# CVATサーバのログを絞って監視
+docker compose logs -f cvat_server | egrep -i "cloud|s3|minio|bucket|error|proxy|deny"
+
+	•	Deny: Private Range が出たら → まだ proxy 無効化が漏れている
+	•	resource ai-pf not found だけになったら → バケット名/権限/endpoint を再確認
+（aws-cli で s3 ls --endpoint-url http://minio:9000 s3://ai-pf が成功することを再チェック）
+
+⸻
+
+⑤（代替）APIでクラウドストレージを作成
+
+UIがエラーでもAPIなら通ることが多いです。管理者でログイン後に：
+
+# ログイン（cookie保存）
+curl -c cookies.txt -X POST -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<CVAT管理者パス>"}' \
+  http://localhost:8080/api/auth/login
+
+# Cloud Storage 作成
+curl -b cookies.txt -X POST -H "Content-Type: application/json" \
+  -d '{
+    "provider_type": "AWS_S3",
+    "resource": "ai-pf",
+    "endpoint_url": "http://minio:9000",
+    "credentials_type": "KEY_SECRET_KEY",
+    "key_id": "admin",
+    "secret_key": "password",
+    "location": "us-east-1",
+    "visibility": "PRIVATE"
+  }' \
+  http://localhost:8080/api/cloudstorages
+# ← 201 Created になればOK
+
+
+⸻
+
+まとめ
+	•	いまのエラーは プロキシ経由ブロックの再発。
+	•	cvat_server を含むバックエンド系すべてで HTTP(S)_PROXY を空にし、NO_PROXY を設定 → 再起動。
+	•	そのうえで Endpoint は http://minio:9000、バケット ai-pf（存在必須）で登録。
+
+ここまでやれば、先の aws-cli テストと同じ状態で CVAT からも成功するはず。進捗（env | grep -i proxy と logs の結果）だけ教えてくれたら、必要なら compose を “最小差分パッチ” にして返すよ。
+
 
 
 
