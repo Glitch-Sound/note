@@ -267,3 +267,94 @@ curl -i http://10.71.82.54:8080/api/server/about
 
 
 
+
+---
+
+スクショの結果（IPで 404、-H "Host: localhost" だと 200）から断定できます：
+
+いまの 404 は “Host ヘッダ不一致” です。
+外側の Nginx も、CVAT 側の Traefik も Host=localhost を前提にしており、ブラウザが Host: 10.71.82.54 を送るとルーティングから外れて 404 になります。
+
+⸻
+
+直し方は3通り（どれか1つでOK）
+
+方式A：CVAT 側を実アドレスに合わせる（おすすめ）
+	1.	CVAT の .env を編集して CVAT_HOST を実アクセス名に変更
+
+CVAT_HOST=10.71.82.54
+
+	2.	反映
+
+docker compose up -d
+
+	3.	外側Nginxは proxy_set_header Host $host; のままでOK。
+	4.	確認
+
+curl -I http://10.71.82.54:8080/
+curl -I http://10.71.82.54:8080/tasks
+
+→ 両方 200 になるはず。
+
+⸻
+
+方式B：外側Nginxで Host を上書きして CVAT に合わせる
+
+（CVAT_HOST を localhost のままにしたい場合）
+
+外側Nginxの server ブロックをこんな感じに修正：
+
+server {
+  listen 8080 default_server;
+  server_name 10.71.82.54 _;   # IPでもホスト名でも可
+
+  location / {
+    proxy_pass http://127.0.0.1:8081;   # CVAT(traefik) の公開ポート
+    proxy_http_version 1.1;
+
+    # ← ここがポイント：CVAT が期待する Host を明示
+    proxy_set_header Host localhost;
+
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    # SPA フォールバック（/tasks 直叩きでもOKにする）
+    error_page 404 = @spa;
+  }
+  location @spa { proxy_pass http://127.0.0.1:8081; }
+}
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+反映：
+
+sudo nginx -t && sudo systemctl reload nginx
+
+
+⸻
+
+方式C：Traefik のルールを緩める（高度）
+
+docker-compose.yml の traefik ラベルを
+Host(\${CVAT_HOST}`)→Host(`${CVAT_HOST}`) || HostRegexp(`{any:.+}`)`
+のようにしてどの Host でも受ける。運用ポリシー上問題なければ。
+
+⸻
+
+追加チェック（念のため）
+	•	CVAT(traefik) がどのポートで待っているか確認：
+
+docker compose ps
+curl -I http://127.0.0.1:8081/              # 例：外側からは8081に公開
+curl -i  http://127.0.0.1:8081/api/server/about
+
+	•	外側Nginxの server_name が IPを受けるか、default_server になっているか。
+
+⸻
+
+まとめ
+	•	原因：Host ヘッダが合わず、ルーティングから外れて 404/502。
+	•	解決：CVAT_HOST を実アクセス名に合わせる（A）、または Nginx で proxy_set_header Host … を上書き（B）。
+	•	SPA の /tasks 直叩きに備え、エラーページ→@spa のフォールバックも忘れずに。
+
