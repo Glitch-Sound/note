@@ -143,6 +143,111 @@ services:
 
 
 
+---
+
+
+
+minio:9000で立ち上げても、cvatからクラウドストレージとして利用できず、エラーが発生する
+
+
+
+---
+
+
+
+見えてるエラーはほぼ「MinIO側でバケットが見つからない（NoSuchBucket）」か「経路解決ミス（path-style未指定）」のどちらかです。最短で直す手順を置きます。
+
+まず3チェック（30秒）
+	1.	バケットが存在するか
+
+	•	MinIOコンソール（http://<ホストIP>:9001）で ai-pf があるか確認
+ないなら作成してください（後述の自動作成でもOK）。
+
+	2.	CVAT⇔MinIO の疎通
+
+# CVATサーバの中から MinIO に届くか
+docker exec -it cvat_server curl -s -o /dev/null -w "%{http_code}\n" http://minio:9000/minio/health/ready
+# ← 200 が返ればOK（同一ネットワーク前提）
+
+	3.	CVATのCloud Storage設定（S3）
+
+	•	Provider: AWS S3
+	•	Bucket name: ai-pf（※事前に存在必須）
+	•	Access key ID / Secret: MinIOのROOTユーザー/パス
+	•	Endpoint URL: http://minio:9000（コンテナ名でOK）
+	•	Use path-style addressing: ON（超重要）
+	•	Use HTTPS: OFF（httpのままなら）
+	•	Region: 入力するなら us-east-1（未指定でも大抵OK）
+
+path-style をOFFにすると http://ai-pf.minio:9000 の仮想ホスト方式になり、DNS解決できずに「resource not found」ぽいエラーになります。
+
+⸻
+
+バケット自動作成付き MinIO 例（Step1向け最小）
+
+CVATと同じ compose に入れて同じネットワークにしてください。
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-07-26T20-48-21Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_REGION_NAME: us-east-1
+    ports:
+      - "9000:9000"  # S3
+      - "9001:9001"  # Console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 15
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-07-26T15-41-22Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 admin password &&
+      mc mb -p local/ai-pf || true &&
+      mc ls local/ai-pf &&
+      echo 'minio bucket ready'
+      "
+volumes:
+  minio-data:
+
+これで ai-pf が毎回用意されます。
+CVAT 側は上のS3設定どおりに入れれば保存できるはず。
+
+⸻
+
+それでも失敗する時の“ピンポイント”確認
+	•	資格情報ミス
+docker run --rm --network <同ネットワーク> minio/mc sh -lc "mc alias set l http://minio:9000 admin password && mc ls l/ai-pf"
+→ これが成功するならキーは正しい。
+	•	ネットワークが別
+CVATとMinIOが別compose／別ネットワークだと minio で解決できません。
+その場合は 同じcomposeに入れる か、MinIOサービスをCVAT側ネットワークに networks: で参加させてください。やむを得ない場合は Endpoint を http://<ホストIP>:9000 にしても動きます。
+	•	時刻ずれ（署名エラーの典型）
+timedatectl でNTPが有効か確認。大きくずれていると S3 認証に失敗します（今回は“resource not found”系っぽいので優先度低）。
+	•	バケット名の禁止文字
+アンダースコア不可。ai-pf のような小文字＋ハイフンはOK。
+
+⸻
+
+まとめ
+	•	バケットは先に作る（または自動作成）
+	•	path-style を ON
+	•	CVAT と MinIO を同ネットワーク
+
+ここまでやれば、スクショのエラーは消えるはず。
+必要なら、あなたの現在の compose に合わせた最小差分パッチ（services/networks の追記だけ）を書いて渡すよ。
+
 
 
 
