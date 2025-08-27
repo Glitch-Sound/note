@@ -339,6 +339,115 @@ docker compose logs -f cvat_server | egrep -i "s3|minio|error|bucket"
 
 
 
+---
+
+
+
+cvatサーバのログは添付のエラーがでる
+
+
+
+---
+
+
+
+スクショのログ、ポイントはここです：
+	•	Failed to resolve remote hostname: lookup mi on 127.0.0.11:53
+	•	requested_host": ":9000"
+	•	ERROR ... The resource ai-pf not found
+
+つまり
+① CVAT が エンドポイントのホスト名を解決できていない（mi を引こうとして失敗）
+②（その後のチェックで）バケット ai-pf が見つからない とも言われています。
+
+まずは DNS（名前解決）を直して、次にバケットの存在を確認、の順でいきましょう。
+
+⸻
+
+直し順（この通りでOK）
+
+1) Cloud Storage の Endpoint を「正しいホスト名」に
+
+URL のホスト部に _ や途中までの文字列は使えません。
+http://minio:9000（サービス名が minio のとき）か、http://<UbuntuのIP>:9000 を入れてください。
+※ いまログには lookup mi ... と出ているので、http://mi:9000 のように途中で切れた値が入っているはず。
+
+2) CVAT と MinIO が同じ Docker ネットワークか確認
+
+同一 compose なら通常は同じネットワークにいます。念のため：
+
+# それぞれがどのネットワークにいるか
+docker inspect -f '{{json .NetworkSettings.Networks}}' <cvat_serverのコンテナ名>
+docker inspect -f '{{json .NetworkSettings.Networks}}' <minioのコンテナ名>
+
+違っていたら、片方をもう一方のネットワークに参加させます（例）：
+
+docker network ls   # ネットワーク名を確認
+docker network connect <cvat側のネットワーク名> <minioのコンテナ名>
+# 失敗したら一度 compose の services に networks を明記して up -d が確実
+
+参考（最小差分イメージ）
+
+networks:
+  cvat_net:
+services:
+  cvat_server:
+    networks: [cvat_net]
+  minio:
+    networks: [cvat_net]
+
+
+
+3) CVAT コンテナから MinIO に届くかを確定
+
+docker exec -it <cvat_server> sh -lc '
+  getent hosts minio;
+  curl -s -o /dev/null -w "%{http_code}\n" http://minio:9000/minio/health/ready
+'
+# → 名前解決ができ、HTTP 200 が返ればOK
+
+もし名前解決がダメなら、Endpoint を一旦 IP 直指定（http://<UbuntuのIP>:9000） にして先へ進んでOKです。
+
+4) バケット ai-pf が存在するかを確定
+
+コンソール（http://<UbuntuのIP>:9001）で作っても良いですが、確実にいくならコマンドで：
+
+# 一時コンテナから S3 API で確認（同じネットワークで実行）
+docker run --rm --network <上で使ったネットワーク名> \
+  -e AWS_ACCESS_KEY_ID=admin \
+  -e AWS_SECRET_ACCESS_KEY=password \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli s3 ls --endpoint-url http://minio:9000 s3://ai-pf || true
+
+# 無いなら作成
+docker run --rm --network <上で使ったネットワーク名> \
+  -e AWS_ACCESS_KEY_ID=admin \
+  -e AWS_SECRET_ACCESS_KEY=password \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli s3 mb --endpoint-url http://minio:9000 s3://ai-pf
+
+5) CVAT の Cloud Storage 画面はこの値で
+	•	Provider: AWS S3
+	•	Bucket name: ai-pf
+	•	Access key / Secret: admin / password（あなたの値）
+	•	Endpoint URL: http://minio:9000（または http://<UbuntuのIP>:9000）
+	•	Region（項目があれば）: us-east-1
+
+UI に「Use path-style / Use HTTPS」のトグルが無いバージョンでも、http を指定していれば HTTPS は自動で使われず、かつ 独自エンドポイント（minio:9000）の場合は path-style が自動選択されるため問題ありません。
+
+⸻
+
+まだダメなら見る場所（原因が絞れます）
+	•	名前解決：getent hosts minio が NG → ネットワーク未共有。
+	•	疎通：curl http://minio:9000/minio/health/ready が 200 以外 → MinIO 未起動 or ポート違い。
+	•	認証：aws-cli で s3 ls が 403/Signature mismatch → アクセスキー or 時刻ズレ（timedatectl でNTP確認）。
+	•	存在：The resource ai-pf not found → バケット未作成（上の「mb」で作成）。
+
+ここまで踏めば通るはず。今の compose の services: とネットワーク定義を貼ってくれたら、そのまま置き換えられる最小差分を作って返すよ。
+
+
+
+
 
 
 
