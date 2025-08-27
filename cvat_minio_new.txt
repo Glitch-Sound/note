@@ -457,7 +457,137 @@ curl -i http://10.71.82.54:8080/api/server/about
 ここまで揃えば、CSRF の更新失敗と 一部 404 は解消できるはずです。
 必要なら、いま使っている docker-compose.yml（traefik のラベルと server の environment 周り）と Nginx の server ブロックを貼ってくれれば、差分だけ書いて仕上げます。
 
+　
 
+
+
+
+---
+
+ありがとうございます。状況は整理するとこうです。
+	•	画面右上のロゴ 404や /api/user_agreements?... の 404 は、Traefik のルーティングが不適切（UI と API を同じルータ／同じサービスに流している or Host ルール不一致）＋ Nginx のプロキシだけで吸収できていないのが原因です。
+	•	CSRF Failed: Origin checking failed は Django 側の許可オリジン不足です。
+
+下の“最小・確実に動く”構成に直すと一気に解消します。
+
+⸻
+
+1) Traefik のラベルを UI と API で分離
+
+現状の traefik.http.routers.cvat.rule を 1本で /api|/static|/admin|/django-rq 等に流していると、/logo.svg や / が cvat_server(8080) に行って 404 になります。
+UI(80) と API(8080) を別ルータ・別サービスにしてください。
+
+cvat_ui サービス（UI）
+
+labels:
+  - traefik.enable=true
+  - traefik.http.routers.cvat-ui.rule=Host(`${CVAT_HOST}`)
+  - traefik.http.routers.cvat-ui.entrypoints=web
+  - traefik.http.services.cvat-ui.loadbalancer.server.port=80
+
+cvat_server サービス（API/管理/静的配布）
+
+labels:
+  - traefik.enable=true
+  - traefik.http.routers.cvat-api.rule=Host(`${CVAT_HOST}`) && (PathPrefix(`/api/`) || PathPrefix(`/admin/`) || PathPrefix(`/static/`) || PathPrefix(`/django-rq/`))
+  - traefik.http.routers.cvat-api.entrypoints=web
+  - traefik.http.services.cvat-api.loadbalancer.server.port=8080
+
+以前の「1本の router で Host(…) || PathPrefix(…)」のようなOR 合体はやめてください。
+/logo.svg のような UI 直配信パスは cvat-ui(80) 側で受けます。
+
+Traefik（外向きポートの公開例）
+
+services:
+  traefik:
+    ports:
+      - "8081:8080"   # 例：Traefik を 8081 で外に出す
+
+
+⸻
+
+2) 外側 Nginx（ポート 8080 で待受 → Traefik:8081 へプロキシ）
+
+server {
+  listen 8080 default_server;
+  server_name 10.71.82.54 _;
+
+  location / {
+    proxy_pass http://127.0.0.1:8081;   # Traefik に渡す
+    proxy_http_version 1.1;
+
+    # Host をそのまま渡す（Traefikの Host ルールに必須）
+    proxy_set_header Host $host;
+
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    # SPA のディープリンクでの 404 を UI にフォールバック
+    error_page 404 = @spa;
+  }
+
+  location @spa {
+    proxy_pass http://127.0.0.1:8081;   # そのまま UI に戻す
+  }
+}
+
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+ここで proxy_set_header Host $host; を必ず付けること。
+以前の設定で固定 Host localhost にしていた場合は、CVAT_HOST と一致させればOKですが、今回は $host（実アクセスの 10.71.82.54）で統一しましょう。
+
+⸻
+
+3) Django（CSRF/CORS/Allowed）を 実オリジンで許可
+
+cvat_server の environment に（必要なものを網羅的に）入れてください：
+
+environment:
+  CVAT_HOST: 10.71.82.54
+  ALLOWED_HOSTS: 10.71.82.54,localhost
+  DJANGO_ALLOWED_HOSTS: 10.71.82.54,localhost
+
+  CSRF_TRUSTED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54
+  DJANGO_CSRF_TRUSTED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54
+
+  CORS_ALLOWED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54
+  DJANGO_CORS_ALLOWED_ORIGINS: http://10.71.82.54:8080, http://10.71.82.54
+
+将来 https にする予定があれば https://10.71.82.54 も同様に追加。
+
+⸻
+
+4) 反映 & 動作確認
+
+# 反映
+docker compose up -d
+sudo nginx -t && sudo systemctl reload nginx
+
+# ルーティングとレスポンスの動作確認
+curl -I http://10.71.82.54:8080/                     # 200（UI）
+curl -I http://10.71.82.54:8080/logo.svg             # 200（UIの静的アセット）
+curl -i  http://10.71.82.54:8080/api/server/about    # 200（API）
+
+ブラウザ側はキャッシュの影響が出るので、ハードリロード（Ctrl+F5 / Cmd+Shift+R）推奨。
+
+⸻
+
+5) コンソールの 404 /api/user_agreements?... について
+
+このエンドポイントは環境/バージョンによって 404 が正常（未設定）な場合があります。
+重要なのは /api/server/about が 200 で、ロゴ（/logo.svg）や画面が正常に出ること。
+上の分離ルーティングに直すと、ここで詰まっていた 404 群は解消するはずです。
+
+⸻
+
+まとめ
+	•	UI(80) と API(8080) のルータを分離 → /logo.svg などの 404 が消える
+	•	Host を正しく渡す & CSRF/CORS/Allowed を実オリジンで許可 → CSRF Failed が解消
+	•	外側 Nginx は Traefik へ単純プロキシ＋SPA フォールバックで十分
+
+もし差し支えなければ、現行の docker-compose.yml（cvat_ui/cvat_server/traefik の labels 節）とNginx の server ブロック全文をそのまま貼ってくれれば、上の形に合わせた“そのまま差し替えられる差分”を書きます。
 
 
 
