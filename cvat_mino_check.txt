@@ -1200,3 +1200,14 @@ docker exec -it cvat_server bash -lc \
 
 
 
+---
+
+https://learn.microsoft.com/ja-jp/cpp/windows/latest-supported-vc-redist?view=msvc-170
+
+
+
+
+
+
+
+
