@@ -1,0 +1,63 @@
+原因は「CVAT が返すダウンロード URL が http://localhost/...（しかもポート指定なし=80）になっている」ためです。
+task.export_dataset(...) はサーバが返した URL に自動で取りに行きますが、あなたのコードは http://10.71.82.54:8080 に接続しているのに、ダウンロード時だけ “ローカルホスト:80” へ行ってしまい Connection refused になっています。
+
+恒久対策（推奨）
+
+CVAT が正しいホストで自己参照 URL を作るよう設定してください。
+	1.	CVAT のホスト名(IP)を明示
+CVAT の docker-compose.yml があるディレクトリで .env に追記/修正:
+
+CVAT_HOST=10.71.82.54
+
+その後:
+
+docker compose down
+docker compose up -d
+
+（sudo を使うなら sudo -E docker compose up -d で環境変数を引き継ぐ）
+※ 公式FAQ/インストールガイドでも CVAT_HOST を設定するよう明記されています。 ￼
+	2.	ポートの扱い
+外部公開が :8080 のままでも動きますが、もし可能なら traefik のポートを 80:8080 にマップすると URL にポートを付けずに済みます（HTTP 既定が 80 なのでミスが減る）。 ￼
+	3.	逆プロキシ(Nginx 等)を前段に置いている場合
+以下ヘッダを上流へ渡す設定を入れてください（Traefik 既定は OK）:
+
+proxy_set_header Host $host:$server_port;
+proxy_set_header X-Forwarded-Host $host:$server_port;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Port $server_port;
+
+応急回避（サーバ設定を直すまで）
+
+SDK のローレベル API で取得した result_url のホストを強制的に差し替えてからダウンロードします（要点だけ）:
+
+from urllib.parse import urlparse, urlunparse
+import time
+from cvat_sdk.core.client import make_client
+
+with make_client("http://10.71.82.54", port=8080, credentials=cvat_credentials) as client:
+    rq_id, _ = client.api_client.tasks_api.create_dataset_export(
+        id=cvat_task_id, format="YOLO 1.1", save_images=False
+    )
+    while True:
+        req, _ = client.api_client.requests_api.retrieve(rq_id)
+        if req.status == "finished":
+            u = urlparse(req.result_url)  # ここが "http://localhost/..." になっている
+            fixed = u._replace(netloc="10.71.82.54:8080")
+            client.download_file(urlunparse(fixed), annotations_filename)
+            break
+        if req.status == "failed":
+            raise RuntimeError(req.message)
+        time.sleep(1)
+
+（Export の開始→rq_id→/api/requests/<rq_id> で状態/URL を取る手順は SDK リファレンスにあります） ￼
+
+追加チェック
+	•	フォーマット名はサーバが提供する一覧に合わせてください（/api/server/about から取得可能。最近は “YOLO”, “Ultralytics YOLO” など）。 ￼
+
+これで localhost:80 へ飛ぶ問題は解消できます。もし .env を直しても直らない場合は、docker compose ps と docker logs traefik を確認し、CVAT_HOST が反映されているか（再起動前後でラベル/ログ）を見てください。
+
+
+
+
+
+
