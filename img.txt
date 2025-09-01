@@ -1,0 +1,213 @@
+Minioに動画(mp4)があり、cvatと連携している
+ユーザが動画内のフレームを選択し、アノテーションを追加している
+
+フロント側で各フレーム毎の画像を表示し、画像上にアノテーション枠を描画したい
+
+画像の情報、及びアノテーション位置はcvatから取得可能なのか
+
+
+---
+
+
+はい、どちらもCVATのREST APIから取得できます。ポイントだけ先に👇
+	•	フレーム画像：GET /api/jobs/{job_id}/data にクエリを付けて 1 枚ずつ取得（例：type=frame&number=<フレーム番号>&quality=compressed）。同APIはJobs APIの “retrieve_data” として公開されています。 ￼
+	•	各フレームのメタ情報（幅・高さ・名前など）：GET /api/jobs/{job_id}/data/meta（Jobs APIの “retrieve_data_meta”）。レスポンスの FrameMeta に width/height が含まれます。 ￼
+	•	アノテーション（矩形・ポリゴン・トラック等）：GET /api/jobs/{job_id}/annotations（Jobs APIの “retrieve_annotations”）。タスク単位でも同様のエンドポイントがあります。 ￼
+	•	画像の “quality” は compressed / original の2系（UI側は軽量化のため通常 compressed）。 ￼
+
+最短実装フロー（フロントで重ね描き）
+	1.	フレームの実寸取得
+GET /api/jobs/{id}/data/meta → frames[n].width/height を保存（拡縮比に使う）。 ￼
+	2.	フレーム画像の取得
+GET /api/jobs/{id}/data?type=frame&number=<n>&quality=compressed
+→ blob を URL.createObjectURL で <img>/<canvas> に表示。 ￼
+	3.	アノテーションの取得
+GET /api/jobs/{id}/annotations を一度だけ呼んでメモリに保持。矩形は points=[x1,y1,x2,y2]、ポリゴン/ポリラインは [x1,y1,x2,y2,...] の座標（ピクセル）と対象 frame が入っています（トラックはフレームごとの形状配列を持ちます）。 ￼
+	4.	スケーリングして描画
+表示サイズを Wdisp×Hdisp、実寸を Worig×Horig とすると、
+scaleX = Wdisp / Worig, scaleY = Hdisp / Horig。
+各 x,y をそれぞれ掛けて <canvas>/SVG へ描画。回転（rotation）が付く形状があれば同じ中心で回転適用。
+※ トラック（追跡）を使っている場合、同一トラック内の「そのフレームに有効な形状（outside=false）」を選んで表示します。
+
+使い分け（Task vs Job）
+	•	Job単位（推奨）：1人のアノテータ作業範囲に一致するので、フロントでのページングが楽。上記の /api/jobs/... を利用。 ￼
+	•	Task単位：タスク全域で取りたい場合は /api/tasks/{task_id}/data / /data/meta / /annotations を同様に使えます。 ￼
+
+ミニ実装例（Vue/TSのイメージ）
+
+// 認証は Cookie セッションなら withCredentials、トークンなら Authorization ヘッダを付与
+const base = 'https://<cvat-host>/api';
+
+async function getMeta(jobId: number) {
+  const res = await fetch(`${base}/jobs/${jobId}/data/meta`, { credentials: 'include' });
+  return await res.json(); // { frames: [{ name, width, height, ... }, ...] }
+}
+
+async function getFrame(jobId: number, frameNo: number, quality: 'compressed'|'original'='compressed') {
+  const res = await fetch(`${base}/jobs/${jobId}/data?type=frame&number=${frameNo}&quality=${quality}`, {
+    credentials: 'include',
+  });
+  const blob = await res.blob();
+  return URL.createObjectURL(blob); // <img :src="url">
+}
+
+async function getAnnotations(jobId: number) {
+  const res = await fetch(`${base}/jobs/${jobId}/annotations`, { credentials: 'include' });
+  return await res.json(); // shapes / tracks を保持
+}
+
+// 描画時：meta.frames[frameNo].width/height を使ってスケール計算 → Canvas/SVG に points を変換して重ね描き
+
+（retrieve_data/meta/annotations エンドポイントは公式APIリファレンスに記載されています。quality 概念も公式ドキュメントに記載あり。） ￼
+
+よくあるハマりどころ
+	•	CORS/CSRF：別オリジンから叩くなら、CVAT側でCORS許可・Cookie送信（withCredentials）またはToken認証を使う。CSRFは通常GETでは不要ですが、POST/PUT等では必要です（CVATは basicAuth/sessionAuth/tokenAuth など複数の認証方式をサポート）。 ￼
+	•	frame番号の基準：CVATは0始まり。/data/meta の並びと一致します。 ￼
+	•	一括先読み：昔は type=chunk で塊取得がありましたが、現在は非推奨。オンデマンドで type=frame を使うのが安全です。 ￼
+
+必要なら、あなたのフロント（Vue + Canvas/SVG）向けに「矩形・ポリゴン・トラック対応の描画ユーティリティ」をそのまま貼れる形で用意します。どの形状タイプを使っているか（矩形のみ？ポリゴンも？トラック運用？）だけ教えてください。
+
+
+
+===
+
+
+
+動画がminioに格納されている
+こちらには推論結果枠の描画も含んだ動画となる
+
+フロント側で指定したフレームに対し、動画から指定されたフレーム位置を画像として抜け出し、フロントに返却することはできるか
+
+
+---
+
+
+できます。やり方は大きく3通りあります。要件（精度・速度・構成）に合わせて選んでください。
+
+1) ブラウザだけで切り出す（最小構成）
+
+MinIOの動画URL（できれば事前署名URL）を <video> に読み込み、currentTime で指定秒までシーク → <canvas> に描画 → 画像（blob）として取得します。
+※ バケット側でCORSを許可し、Access-Control-Allow-Origin をフロントのオリジンにしておくこと（Range再生用のヘッダを使うため）。ブラウザの動画再生はHTTP Rangeを使うので、Range/Content-Range系ヘッダの扱いに注意します。 ￼ ￼
+
+// Vue 3 / TS の例：指定秒を1フレーム画像として取得
+async function grabFrameFromUrl(url: string, tSec: number): Promise<Blob> {
+  const video = document.createElement('video');
+  video.crossOrigin = 'anonymous';    // CORS有効（MinIO側CORS必須）
+  video.muted = true;                 // モバイルの自動再生対策
+  video.playsInline = true;
+  video.src = url;
+
+  await new Promise((ok) => video.addEventListener('loadedmetadata', ok, { once: true }));
+  video.currentTime = tSec;
+  await new Promise((ok) => video.addEventListener('seeked', ok, { once: true }));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(video, 0, 0);
+
+  return await new Promise((ok) => canvas.toBlob((b) => ok(b!), 'image/jpeg', 0.92)!);
+}
+
+精度面：ブラウザのシークは最近傍のデコード可能フレームに寄るので、GOP間隔が長い動画では「フレーム番号ぴったり」にならないことがあります。フレーム単位の厳密さが必要なら次の「サーバ抽出」が安全です。
+
+MinIO側 CORS 例（mc）：
+
+{
+  "Version": "2015-12-11",
+  "Statement": [{
+    "AllowedOrigin": ["https://your-frontend.example.com"],
+    "AllowedMethod": ["GET", "HEAD"],
+    "AllowedHeader": ["*","Range"],                // 動画再生で必要
+    "ExposeHeader": ["Accept-Ranges","Content-Range","Content-Length"],
+    "MaxAgeSeconds": 86400
+  }]
+}
+
+適用：mc cors set-json myminio/your-bucket ./cors.json  ￼ ￼
+
+⸻
+
+2) サーバ（FastAPI + FFmpeg）で正確に切り出す（精度重視）
+
+バックエンドがMinIOから直接読んで（事前署名URLやSDK）、FFmpegで単一フレーム抽出 → 画像をHTTPでストリーミング返却。フレーム番号指定も、時刻指定もOK。
+	•	時刻指定・高速（近傍キー フレーム）：
+ffmpeg -ss {time} -i "{url}" -frames:v 1 -q:v 2 -f image2pipe -
+	•	時刻指定・厳密（フレーム精度）：
+ffmpeg -i "{url}" -ss {time} -frames:v 1 -q:v 2 -f image2pipe -（入力後の -ss はより正確）
+	•	フレーム番号指定：fps を ffprobe で取得し、time = frame / fps に変換して上記コマンド。
+（-vf "select=eq(n\,FRAME)" も可能ですが、頭からデコードが必要になり遅くなりがちです） ￼
+
+FastAPIの最小例（Python / サーバ側はFFmpeg利用）：
+
+# pip install fastapi uvicorn minio
+# FFmpegはコンテナにバンドル推奨
+from fastapi import FastAPI, Query, Response
+from minio import Minio
+import subprocess, shlex, json
+
+app = FastAPI()
+mc = Minio("minio:9000", access_key="...", secret_key="...", secure=False)
+
+def presign_get(bucket: str, key: str) -> str:
+    return mc.get_presigned_url("GET", bucket, key)  # 期限付きURL
+
+def ffprobe_fps(url: str) -> float:
+    cmd = 'ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate ' \
+          '-of default=nokey=1:noprint_wrappers=1 "{}"'.format(url)
+    r = subprocess.check_output(shlex.split(cmd)).decode().strip()
+    num, den = map(int, r.split('/')) if '/' in r else (float(r), 1)
+    return num / den
+
+@app.get("/frame.jpg")
+def frame(bucket: str, key: str, t: float | None = None, f: int | None = None,
+          precise: bool = False, q: int = 2):
+    url = presign_get(bucket, key)
+    if t is None and f is None:
+        return Response(status_code=400)
+    if t is None:
+        fps = ffprobe_fps(url)
+        t = f / fps
+
+    # 速い/正確の二択
+    if precise:
+        cmd = f'ffmpeg -hide_banner -loglevel error -i "{url}" -ss {t:.6f} -frames:v 1 -q:v {q} -f mjpeg -'
+    else:
+        cmd = f'ffmpeg -hide_banner -loglevel error -ss {t:.6f} -i "{url}" -frames:v 1 -q:v {q} -f mjpeg -'
+
+    img = subprocess.check_output(shlex.split(cmd))
+    return Response(content=img, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=300"})
+
+ポイント
+	•	サーバはMinIOのオブジェクトをダウンロードせず、事前署名URL経由でFFmpegに渡すと高速。
+	•	返却は image/jpeg（可逆が必要なら PNG に変更）。
+	•	高負荷対策：簡易キャッシュ（/frame.jpg?... をキーにメモリ/Redis）。
+	•	29.97fps等の非整数fpsや可変fpsでは、avg_frame_rate を使った「秒→フレーム」換算が最も無難。
+
+⸻
+
+3) CVATからフレームをもらう（既にタスク化している場合）
+
+CVATに取り込んだ同一動画がタスク/ジョブとして存在するなら、CVATのフレーム取得APIで画像1枚を取得できます（quality=compressed|original）。CLIでは cvat-cli task frames <task_id> <frame...> がそのまま使われています（内部は GET /api/.../data 系）。既に推論枠が動画に焼き込まれているなら、そのままの絵が返ります。 ￼
+
+⸻
+
+どれを選ぶべき？
+	•	最小コスト／UIだけで完結 → ① ブラウザだけ
+	•	要件：厳密なフレーム一致が不要、CORS設定ができる
+	•	フレーム精度／大量アクセスに強い → ② FastAPI + FFmpeg
+	•	要件：バックエンドを1本立てられる
+	•	既にCVATに読み込んでいる → ③ CVAT API
+	•	要件：CVATの認証・権限管理に乗せたい、アノテーション情報と同じID体系で扱いたい
+
+必要なら、上の②をDocker込み（uvicorn + ffmpeg入りイメージ、MinIOの環境変数）で丸ごと提供します。フロントのVue側ユーティリティ（URL生成・画像切替・キャッシュ）もあわせて出せます。
+
+
+
+
+
+
+
+
