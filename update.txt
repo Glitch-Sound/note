@@ -1,0 +1,133 @@
+結論：そのやり方は“動くこともある”けど、いくつか危険ポイントがあります。より安全にやるなら dpkg ループではなく apt install ./*.deb を使って一括インストール（依存解決を apt に任せる）か、ローカルの簡易APTリポジトリを作るのがベターです。以下ポイントと実用手順をまとめます。
+
+⸻
+
+注意ポイント（あなたのスクリプト）
+	•	変数タイポ：DEB_DIR を宣言しているのに "$DEV_DIR" を回しています（DEV→DEB）。
+	•	依存関係：dpkg -i は依存解決をしません。インストール順によっては失敗→壊れた依存状態になります。
+	•	sudo-ldap の扱い：先に dpkg -r sudo-ldap すると、一時的に sudo 系が消える可能性があります（WSLなら root で入れるので致命傷にはなりにくいが、作業中に sudo が使えなくなる）。
+	•	検証不足：コピーしてきた .deb が Ubuntu の同一リリース/アーキテクチャ向けであることの確認が必要。
+
+⸻
+
+おすすめの更新手順（オフラインで安全に）
+
+0) 事前に確認（オフライン側）
+
+. /etc/os-release
+echo "codename=$VERSION_CODENAME"   # 例: jammy, noble など
+dpkg --print-architecture           # 例: amd64
+
+→ オンライン側は 同じ codename/arch の環境でパッケージを集めてください（最も確実なのは同じUbuntuリリースのコンテナやVMでダウンロードすること）。
+
+1) オンライン側で .deb を集める（依存ごと）
+
+一番ラクなのは「同じリリースの“まっさらな”コンテナ」で：
+
+# (オンライン側) 同じリリースのUbuntuコンテナを用意して
+sudo apt update
+sudo apt-get --download-only install sudo
+# /var/cache/apt/archives/ に sudo と依存 .deb が溜まる
+mkdir -p ~/sudo_debs && cp /var/cache/apt/archives/*.deb ~/sudo_debs/
+
+既に最新が入っている環境だとダウンロードされないことがあるので、“クリーンな環境”で --download-only install がコツです。
+あるいは apt-offline を使う方法もあります（より厳密に署名検証を保ちやすい）。
+
+2) オフライン側へ転送
+
+~/sudo_debs をオフラインWSLにコピー（USBや共有フォルダ経由など）し、例として /opt/offline-debs に置く。
+
+3) 一括インストール（依存解決は apt に任せる）
+
+# 念のため root シェルで（WSLなら管理者PowerShellから）
+# wsl.exe -d <ディストリ名> -u root
+cd /opt/offline-debs
+apt install -y ./*.deb
+
+	•	apt install ./... は 指定した .deb 群の中で依存解決をしてくれるため、順序を気にせず入れられます（ネット接続が無くてもOK。足りない依存があればここで分かる）。
+	•	原則 先に sudo-ldap を削除しない ほうが安全です。もし新 sudo と競合してエラーになった場合のみ、rootシェル上で apt remove -y sudo-ldap → 再度 apt install -y ./*.deb を実行してください。
+
+4) 動作確認
+
+sudo --version
+dpkg -l sudo | grep ^ii
+visudo -c   # /etc/sudoers の構文チェック
+sudo -l     # 実際に sudo が通るか
+
+
+⸻
+
+もっと堅牢にやる：ローカルAPTリポジトリ化（任意）
+
+dpkg-dev を用意できるなら、転送したディレクトリを簡易リポジトリにして apt に“通常のリポジトリ”として扱わせる方法もあります。
+
+apt-get install -y dpkg-dev   # 事前にあるなら不要（オフラインだと入れにくいので任意）
+cd /opt/offline-debs
+dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz
+
+# /etc/apt/sources.list.d/offline.list を作成（trusted はローカル用途で）
+echo "deb [trusted=yes] file:/opt/offline-debs ./" > /etc/apt/sources.list.d/offline.list
+
+apt update
+apt install -y sudo
+
+利点：完全に apt のワークフローで管理でき、今後もここに .deb を追加するだけで管理が楽になります。
+
+⸻
+
+あなたのスクリプトを直すなら（最小修正）
+
+どうしても dpkg ループでいくなら、せめて変数とエラーハンドリングを直し、最後に apt に整えてもらう形にします（ただし依存欠落があるとオフラインでは復旧不能になることがある点に注意）。
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEB_DIR="${DEB_DIR:-./sudo_packages}"
+
+# sudo が必要な間に消えると困るので、可能なら root で実行
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root (on WSL: wsl.exe -u root)"; exit 1
+fi
+
+shopt -s nullglob
+debs=("$DEB_DIR"/*.deb)
+if (( ${#debs[@]} == 0 )); then
+  echo "No .deb found in $DEB_DIR"; exit 1
+fi
+
+# 先に削除しない：競合したらその時だけ remove
+# dpkg -r sudo-ldap  # ←原則やらない
+
+# まずは一括で入れてみる（順序は気にしない）
+dpkg -i "${debs[@]}" || true
+
+# 競合・未解決があればここで明示的に対応
+# 例: sudo-ldap 競合なら remove
+if dpkg -l sudo-ldap >/dev/null 2>&1; then
+  # 競合と判断できた場合のみ（ログを見てから）
+  # dpkg -r sudo-ldap
+  :
+fi
+
+# 最後に apt で整える（ローカル .deb のみで解決）
+# ※ 事前に全部の依存 .deb を集めてあることが前提
+apt install -y "$DEB_DIR"/*.deb
+
+
+⸻
+
+追加の実務TIP
+	•	署名/出所：可能なら公式ミラーから取得（apt-get --download-only）。手動で拾った .deb を dpkg -i するだけだとリポジトリ署名検証の恩恵を受けにくいです。
+	•	ロールバック：旧版 .deb も一緒に保管しておくと、万一のダウングレードが楽です（apt install ./sudo_<old>.deb）。
+	•	WSL での保険：作業は root シェルで。sudo が一瞬消えても慌てないように。
+	•	バージョン整合：apt-cache policy sudo（オンライン側）で候補版を確認し、Ubuntu の codename と arch が一致している .deb を収集してください。
+
+⸻
+
+まとめ
+	•	dpkg -i ループだけでの更新は依存解決がなく壊れやすいです。
+	•	推奨は「オンラインで依存ごと .deb を収集 → オフラインで apt install ./*.deb」または「ローカルAPTリポジトリ化」。
+	•	sudo-ldap は最初に消さない。競合が出たらその時だけ対処。
+	•	変数は DEB_DIR に統一を。
+
+この方針なら、オフライン環境でも安全に sudo を更新できます。必要なら、あなたの Ubuntu リリース（例: 22.04 / 24.04）に合わせた具体的な収集コマンド例も書き起こしますよ。
