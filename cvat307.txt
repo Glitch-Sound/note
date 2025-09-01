@@ -1,0 +1,84 @@
+Vue→Fastapi→cvatでは307 temporary redirectが発生し、同apiをfastapiのswagger uiから実行すると成功する
+
+原因は何が考えられるか
+
+
+---
+
+
+なるほど、その症状はよくあるパターンです。
+**「Swagger では成功、Vue → FastAPI 経由だと 307」**のときは、だいたい次のどれかが原因です（優先度順）。
+
+よくある原因トップ4
+	1.	CVAT(Django/DRF)の末尾スラッシュ補完による 307
+	•	CVAT は多くの API で末尾 / を要求します。
+例: /api/tasks に POST すると 307 → /api/tasks/ へリダイレクト。
+	•	Swagger からは正しいパス（末尾 / あり）で叩いているのに、Vue 側の経路では /api/tasks のようにスラッシュ抜けになっていて 307 が出る…という典型。
+	•	対策:
+	•	Vue→FastAPI（→CVAT）で呼ぶ URLを必ず末尾 / 付きに統一。
+	•	FastAPI が CVAT を叩く側で リダイレクト追従を有効にする（後述コード）。
+	2.	Preflight(OPTIONS) が 307 されて失敗
+	•	フロントは CORS のため OPTIONS を飛ばします。これがスラッシュ補完や HTTP→HTTPS で 307 されると、ブラウザ規約上うまく通らず本処理も失敗。
+	•	Swagger は同一オリジンで叩くので Preflight が不要 or 素直に通って成功しがち。
+	•	対策:
+	•		1.	と同じく 正しい最終URL に直で当てる（スラッシュ/スキーム/ホストをそろえる）。
+	•	FastAPI に CORSMiddleware を正しく設定（OPTIONS を確実に 204 で返す）。
+	3.	認証リダイレクト（ログインへ 307/302）
+	•	CVAT 側がセッション前提だと、未認証で ログインURLへリダイレクト。
+	•	Swagger ではトークン/ヘッダが入っているのに、FastAPI 経由のサーバ側で Authorization ヘッダを付け忘れて CVAT に渡せていない、など。
+	•	対策: FastAPI から CVAT へ Authorization: Token ... などのヘッダを必ず付与。Cookie ベースなら withCredentials と CORS 設定もセットで。
+	4.	HTTP→HTTPS の内部 307(“Internal Redirect”)
+	•	Vue 側のベースURLが http:// になっていて、ブラウザやプロキシで https:// へ 307。Swagger は最初から https を使っており成功。
+	•	対策: すべて https に統一。混在コンテンツ排除。
+
+まず確認するポイント
+	•	DevTools の Network で最初のレスポンスを見て、Location ヘッダの行き先・メソッド維持（307はPOST→POST）を確認。
+	•	Copy as cURL（Vue 呼び出し）と Swagger の cURL を比較：
+	•	パス末尾の /、Origin/Host/スキーム、Authorization の違いをチェック。
+	•	curl -v -X OPTIONS（Preflightの再現）→ 307 が出ていないか。
+
+すぐ効く対策（最小修正例）
+
+(A) FastAPI → CVAT の呼び出しでリダイレクト追従をON
+
+import httpx
+
+CVAT = "https://cvat.example.com/api/"
+
+async def call_cvat(path: str, payload: dict, token: str):
+    url = CVAT + (path if path.endswith("/") else path + "/")  # 末尾スラッシュ強制
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+        r = await client.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Token {token}"},  # 必要なら
+        )
+    return r
+
+(B) FastAPI に CORS を正しく付与（Preflight を確実に通す）
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://your-frontend.example.com"],  # *ではなく厳密に
+    allow_credentials=True,
+    allow_methods=["*"],   # OPTIONS を含む
+    allow_headers=["*"],
+)
+
+(C) Vue 側
+	•	叩く エンドポイントは末尾 / を必ず付ける。
+	•	ベースURLを https に統一。
+	•	Cookie 認証なら axios.defaults.withCredentials = true とサーバ側の Access-Control-Allow-Credentials: true の整合。
+
+これで切り分けられるはず
+	•	Location が /.../ になっている → 末尾スラッシュ問題（1）
+	•	OPTIONS が 307 → Preflight リダイレクト問題（2）
+	•	Location が /auth/login 等 → 認証リダイレクト（3）
+	•	http→https に化けている → スキーム不統一（4）
+
+もし Network の 1 リクエスト分（リクエスト/レスポンスヘッダと Location）のスクショを 1枚貼ってくれたら、どのケースか即断してピンポイント修正を出すよ。
+
+
+
