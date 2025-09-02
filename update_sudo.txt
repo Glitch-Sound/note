@@ -275,91 +275,118 @@ sudo --version, visudo -c, dpkg -l sudo | grep ^ii
 
 ==========
 
-オフラインPC①とオフラインPC②が必ず同一環境で可能性がある場合、sudo、及び依存パッケージをインストールする方法はあるか？
+オフラインPC①とオフラインPC②が同一環境、オンラインPCが別環境の場合、sudo、及び依存パッケージをインストールする方法はあるか？
 
 
 ---
 
-はい、PC①/PC②が同一環境（同じUbuntu版・アーキ・sources）なら、試験で通ったものをそのまま本番に流用できます。やり方は2通り。どちらも「PC②で検証 → 同一物をPC①へ適用」です。
+はい、あります。条件が「オフラインPC①＝②は同一、オンラインPCは別環境」なら、PC②で“要求（署名）”を作り→オンラインPCで取得→PC②で検証→同じ成果物をPC①に適用、が最短かつ堅牢です。やり方は2通り（A推奨、B簡便）。
 
 ⸻
 
-方法A（おすすめ・安全寄り）：apt-offline の同一バンドルを使い回す
+A. 最推奨：apt-offline バンドルをPC②で作ってPC①にも使い回す
 
-同じ zip をPC②とPC①で使うだけなのでズレが出にくいです。
+オンラインPCが別環境でも問題なし（PC②のリポ情報を使って取得するため）。
 
-PC②（オフライン・試験）
+手順（コピペ可）
 
-# 署名作成（sudoだけ更新）
+0) PC②（オフライン・試験）で確認
+
+. /etc/os-release; echo "codename=$VERSION_CODENAME"
+dpkg --print-architecture
+
+PC①も同じ値であることを前提に進めます。
+
+1) apt-offline の用意（PC②に未導入なら）
+
+オンラインPCで PC②と同じUbuntu版のDocker を使って .deb を集めるのが手軽：
+
+# オンラインPC（例：PC②が 22.04 の場合 → ubuntu:22.04）
+mkdir -p ~/apt-offline_debs && cd ~/apt-offline_debs
+docker run --rm -v "$PWD":/out ubuntu:22.04 bash -lc '
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get -y --download-only install apt-offline
+  cp -a /var/cache/apt/archives/*.deb /out/
+'
+
+USB等でPC②へ持込み、PC②で：
+
+cd /mnt/usb/apt-offline_debs
+sudo dpkg -i ./*.deb || sudo apt -f install
+
+2) PC②で“要求（署名）”を作る
+
 sudo apt-offline set ~/sudo.sig --update --upgrade --install-packages sudo
-# sudo-ldapも一緒なら: --install-packages sudo,sudo-ldap
+# sudo-ldap も一緒に更新したいなら: --install-packages sudo,sudo-ldap
 
-オンラインPC
+3) オンラインPCで取得（署名検証つきで依存も含め一括）
 
-sudo apt-offline get ~/sudo.sig --bundle ~/sudo_bundle.zip
+sudo apt-offline get ~/sudo.sig --bundle ~/sudo_bundle_PC2.zip
 
-PC②（検証適用）
+4) PC②で適用＆検証
 
-sudo apt-offline install ~/sudo_bundle.zip
-sudo apt install -y sudo    # 必要なら sudo-ldap も併せて
-sudo --version && visudo -c
+sudo apt-offline install ~/sudo_bundle_PC2.zip
+sudo apt install -y sudo    # 必要なら sudo-ldap も
+sudo --version
+visudo -c
 
-PC①（本番適用：同じzipを持参して同じ操作）
+5) PC①（本番）へ同じzipを持込み、同じ適用
 
-sudo apt-offline install ~/sudo_bundle.zip
+sudo apt-offline install ~/sudo_bundle_PC2.zip
 sudo apt install -y sudo
-sudo --version && visudo -c
+sudo --version
+visudo -c
 
 ポイント
-	•	同一zipなので、PC②で通ればPC①でも再現性が高い。
-	•	リポ署名検証が効くので改ざん検知の観点でも良好。
+	•	PC②とPC①が同一環境なので 同じzipを安全に再利用できます。
+	•	リポ署名を維持するため 改ざん検知とバージョン整合が担保されます。
+	•	途中で sudo-ldap を先に削除しない（必要になった時だけ sudo apt remove sudo-ldap → 再度 apt install）。
 
 ⸻
 
-方法B（もっと手軽）：PC②で使った .deb 一式をそのままPC①へ
+B. もっと手軽：Dockerで“.deb一式”を吸い出してPC②→PC①へ
 
-apt install ./*.deb はローカルの依存解決をしてくれるので、PC②とPC①が同一なら同じセットでそのまま入ります。
+署名一括管理はAより弱いですが、依存まで揃って簡単です。
 
-オンラインPC（取得。Dockerがあれば最短）
+オンラインPC（PC②と同じUbuntuタグのコンテナで取得）
 
-# 例：Ubuntu 24.04（noble）。22.04なら ubuntu:22.04 に置換
+# 例：PC②/①が 24.04 の場合
 mkdir -p ~/sudo_debs && cd ~/sudo_debs
 docker run --rm -v "$PWD":/out ubuntu:24.04 bash -lc '
   set -e
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get -y --download-only install sudo
+  # PC①/②に sudo-ldap が入っているなら一緒に：
+  # DEBIAN_FRONTEND=noninteractive apt-get -y --download-only install sudo-ldap
   cp -a /var/cache/apt/archives/*.deb /out/
 '
-# sudo-ldapが本番に入っているなら、同様に --download-only install sudo-ldap も追加して取得
 
-PC②（検証適用）
-
-cd /mnt/usb/sudo_debs
-sudo apt install -y ./*.deb
-sudo --version && visudo -c
-
-PC①（本番適用：PC②で使った“同じ .deb セット”をそのまま）
+PC②（試験）でインストール → 検証
 
 cd /mnt/usb/sudo_debs
 sudo apt install -y ./*.deb
-sudo --version && visudo -c
+sudo --version
+visudo -c
+
+PC①（本番）で PC②で使った同じ .deb セット をインストール
+
+cd /mnt/usb/sudo_debs
+sudo apt install -y ./*.deb
+sudo --version
+visudo -c
 
 ポイント
-	•	同一環境であれば依存も一致するので、同じ .deb セットで再現可能。
-	•	収集時のUbuntuタグはPC①/②のリリースに合わせる（例：22.04=ubuntu:22.04、24.04=ubuntu:24.04）。
-	•	署名検証の堅さは方法Aに劣るが、手軽さは高い。
+	•	コンテナのタグをPC②/①のリリースに合わせる（22.04=ubuntu:22.04, 24.04=ubuntu:24.04）。
+	•	念のためPC②で sha256sum *.deb > SHA256SUMS を作り、PC①で sha256sum -c すると転送検証が楽。
 
 ⸻
 
-最小限の注意
-	•	sudo-ldapは先に消さない。 競合が出たときだけ sudo apt remove sudo-ldap → もう一度 apt install ./*.deb。
-	•	同一条件の確認：source /etc/os-release; echo $VERSION_CODENAME; dpkg --print-architecture がPC①/②で一致していること。
-	•	念のため PC②で成功した .deb セットをハッシュ固定してPC①へ（例：sha256sum *.deb > SHA256SUMS、PC①で sha256sum -c）。
+最小の注意事項
+	•	sudo は作業途中に使えなくなると困るので、WSL2なら rootシェルで作業が安心（wsl.exe -u root）。
+	•	sudo-ldap は 先に remove しない。競合が出たらその時だけ対処。
+	•	適用後は毎回 sudo --version と visudo -c で確認。
 
-⸻
-
-迷ったら**方法A（apt-offline同一バンドル）**がより安全、**方法B（.deb使い回し）**が最短です。リリース（22.04 or 24.04 など）を教えてくれたら、コマンドをその版にピタッと合わせて短縮版を出します。
-
+Aがいちばん安全、Bがいちばん手軽です。PC②/①のUbuntuバージョン（22.04 / 24.04 など）が分かっていれば、その版に合わせて上のコマンドを短縮して出せます。
 
 
 
