@@ -1,0 +1,376 @@
+前提として以下の環境がある
+
+オフラインPC①：本番環境
+オフラインPC②：試験環境A
+オンラインPC：試験環境B
+
+オフラインPC①とオフラインPC②にはそれぞれWSL2上に同一のUbuntuがインストールされている
+
+sudoの脆弱性があり、修正されたソフトウエアが公開されているため、取り込みたい
+sudo、及び依存するパッケージのdebファイルをオンラインPCで収集し、オフラインPC①にインストールしたい
+
+オフラインPC①は遠隔にあるため、反映確認などはオフラインPC②にて行いたい
+
+
+==========
+
+方法①:安全さ重視
+
+了解。その3台構成なら、apt-offline 方式で「オンラインPCで安全に取得 → オフラインPC②で動作確認 → 同じバンドルをオフラインPC①へ適用」という流れがいちばん堅いです。以下、コピペで進められる最短手順です。
+
+⸻
+
+全体フロー（結論）
+	1.	オフラインPC②（試験A）で apt-offline の署名ファイルを作る
+	2.	オンラインPC（試験B）で、その署名を使って 必要な .deb を署名付きで一括取得(zip化)
+	3.	オフラインPC②に戻して適用 → sudo 更新を検証
+	4.	問題なければ 同じzip を オフラインPC①（本番）へ持ち込み、同手順で適用
+
+オフラインPC①/②が 同じ Ubuntu コードネーム & アーキ で、sources.list も同等なら、同じ zip をそのまま使い回せます。
+
+⸻
+
+事前確認（オフラインPC①/②）
+
+オフラインPC①でも実行できるなら同様に出力して控えてください。最低限、オフラインPC②では必須です。
+
+. /etc/os-release
+echo "codename=$VERSION_CODENAME"   # 例: jammy / noble
+dpkg --print-architecture           # 例: amd64
+echo "==== sources ===="
+cat /etc/apt/sources.list
+ls -1 /etc/apt/sources.list.d
+
+	•	PC①とPC②で codename/arch/sources が同一か確認。
+	•	もし PC①とPC②で sources が異なる場合は、PC①でも同じ「署名セット」を作るのが理想ですが、遠隔で難しい場合はPC②側のsourcesをPC①に合わせる（コンポーネントの有無、ミラーURL 等）か、少なくとも**主要リポ（main, updates, security）**が一致することを確認してください。
+
+⸻
+
+apt-offline の導入（オフラインPC②）
+
+オフラインPC②に apt-offline が未導入なら、オンラインPCで .deb を集めて持ち込みます。
+オンラインPC側は“ホストのAPTを汚さず”にダウンロード専用ディレクトリを使います。
+
+オンラインPC：PC②の sources をコピーしてダウンロード専用キャッシュを作成
+
+USB等で PC②の /etc/apt/sources.list* をオンラインPCへ持ってきてから：
+
+# オンラインPC
+mkdir -p ~/apt-download/{etc/apt,sources.list.d,cache/archives,state}
+cp /path/from/usb/sources.list ~/apt-download/etc/apt/sources.list
+# sources.list.d があれば同様にコピー
+# cp /path/from/usb/*.list ~/apt-download/etc/apt/sources.list.d/
+
+cd ~/apt-download
+sudo apt-get \
+  -o Dir::Etc::sourcelist=./etc/apt/sources.list \
+  -o Dir::Etc::sourceparts=./etc/apt/sources.list.d \
+  -o Dir::State=./state \
+  -o Dir::Cache=./cache \
+  update
+
+sudo apt-get \
+  -o Dir::Etc::sourcelist=./etc/apt/sources.list \
+  -o Dir::Etc::sourceparts=./etc/apt/sources.list.d \
+  -o Dir::State=./state \
+  -o Dir::Cache=./cache \
+  --download-only install apt-offline
+
+.deb は ~/apt-download/cache/archives/ に溜まります。これらを USB で オフラインPC②へ。
+
+オフラインPC②：apt-offline をインストール
+
+# オフラインPC②
+cd /path/from/usb/archives
+sudo dpkg -i ./*.deb || sudo apt -f install
+
+
+⸻
+
+手順①（オフラインPC②）：署名ファイルを作る
+
+sudo だけを更新したい想定です。sudo-ldap が入っているなら一緒に指定可。
+
+# オフラインPC②
+sudo apt-offline set ~/apt-sudo.sig \
+  --update \
+  --upgrade \
+  --install-packages sudo
+# sudo-ldap も必要なら:
+# sudo apt-offline set ~/apt-sudo.sig --update --upgrade --install-packages sudo,sudo-ldap
+
+
+⸻
+
+手順②（オンラインPC）：必要物を一括取得（署名維持）
+
+# オンラインPC
+sudo apt-offline get ~/apt-sudo.sig \
+  --bundle ~/sudo_update_$(date +%Y%m%d).zip
+
+この zip に 署名付きのパッケージメタデータ + 依存を含む .deb 一式 が入ります。
+PC②の sources に基づいた最適な組み合わせが揃うので、改ざん検知・バージョン不整合のリスクが低いです。
+
+⸻
+
+手順③（オフラインPC②）：適用して検証
+
+# オフラインPC②
+sudo apt-offline install ~/sudo_update_YYYYMMDD.zip
+# これでAPTキャッシュに反映済み
+
+# 実際の適用（ネット不要）
+sudo apt install sudo -y
+# sudo-ldap も一緒に更新したい場合: sudo apt install sudo sudo-ldap -y
+
+# 動作確認
+sudo --version
+dpkg -l sudo | grep ^ii
+visudo -c
+sudo -l
+
+WSL2の更新作業は root シェルでやると安心です（作業途中に sudo が一時的に使えなくなっても慌てない）。
+例：Windows から wsl.exe -d <ディストリ名> -u root
+
+（任意）CVEが解消されたかのローカル確認
+
+多くの場合、パッケージの変更履歴に CVE/USN が記載されます。
+
+zgrep -iE 'CVE-|USN-' /usr/share/doc/sudo/changelog.Debian.gz | head -n 20
+
+ここに対象CVEやUSNが出ているか確認（CVE番号を把握しているなら grep CVE-YYYY-NNNN）。
+
+⸻
+
+手順④（オフラインPC①）：本番へ適用
+	•	PC①とPC②の codename/arch/sources が同じなら、PC②で使った zip をそのままPC①へ持参して、同じ手順③を実施すればOKです。
+	•	もし PC①の sources が微妙に違う場合は、PC①でも署名ファイルを作るのが最善：
+
+# オフラインPC①
+sudo apt-offline set ~/apt-sudo.sig --update --upgrade --install-packages sudo
+
+これをオンラインPCに持ち帰って apt-offline get → zip を作り直し → PC①で apt-offline install → sudo apt install sudo。
+
+⸻
+
+よくあるハマり所と対処
+	•	先に sudo-ldap を削除しないこと。 競合が出たときだけ sudo apt remove sudo-ldap → 再度 sudo apt install sudo。
+	•	アーキ/コードネーム不一致：dpkg --print-architecture と VERSION_CODENAME を必ず確認。
+	•	sources に “security/updates” 抜け：USNの修正が入らない原因に。-security と -updates が入っているかチェック。
+	•	apt-offline 未導入のまま強行する案（非推奨）
+	•	オンラインPCで「分離APTディレクトリ」方式（前回説明の -o Dir::...）で --download-only install sudo を実行し、生成された .deb を持ち込んで オフライン側で sudo apt install ./*.deb でも動きます。
+	•	ただし 署名検証の担保が弱くなるので、今回は apt-offline 推奨のままにしてください。
+
+⸻
+
+これで安全に進められます
+	•	PC②で署名→オンラインでzip化→PC②で検証→PC①へ展開が基本形。
+	•	署名ベースなので 改ざん検知・依存/バージョン整合が効きます。
+	•	最後は sudo --version と visudo -c まで確認して完了。
+
+必要なら、あなたの 実際の codename/arch/sources を教えてくれれば、コマンドをあなたの環境に完全合わせ（1行ずつ）で書き直します。
+
+
+
+
+==========
+
+方法②:もう少しお手軽
+
+あるよ。「できるだけ手軽」かつ「そこそこ安全」なやり方を2つまとめたよ。どちらも最終的には オフライン側で apt install ./*.deb に任せるので依存解決でハマりにくい。
+
+⸻
+
+方式A：使い捨てDockerで .deb を一気に集める（最短・おすすめ）
+
+オンラインPCに Docker/Podman があるならこれが一番ラク。同じUbuntuリリースの公式イメージを使って sudo と依存の .deb をまとめて吸い出すだけ。
+
+例：Ubuntu 24.04（noble）の場合。22.04なら ubuntu:22.04（jammy）に置き換え。
+
+# オンラインPC
+mkdir -p ~/sudo_debs && cd ~/sudo_debs
+
+docker run --rm -v "$PWD":/out ubuntu:24.04 bash -lc '
+  set -e
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get -y --download-only install sudo
+  # オフライン側に sudo-ldap が入っているなら一緒に落としておく
+  # DEBIAN_FRONTEND=noninteractive apt-get -y --download-only install sudo-ldap
+  cp -a /var/cache/apt/archives/*.deb /out/
+'
+
+できた *.deb をUSB等で オフラインPC② → 動作確認 → そのままオフラインPC①へ持っていく。
+
+オフラインPC②/①（WSL2）での適用：
+
+cd /mnt/usb/sudo_debs   # 置いた場所
+sudo apt install -y ./*.deb
+sudo --version
+visudo -c
+
+ポイント
+	•	コンテナが“クリーン環境”の代わりなので、ホストを汚さず依存まで揃う。
+	•	イメージのタグ＝オフラインPCのリリースに合わせる（24.04=ubuntu:24.04, 22.04=ubuntu:22.04）。
+	•	sudo-ldap が本番に入っているなら、収集時にも一緒に --download-only install sudo-ldap しておくと確実。
+
+⸻
+
+方式B：クリーン環境なしでもOKな「分離APTディレクトリ」一発スクリプト
+
+Dockerが使えない場合でも、オンラインPC上に分離ディレクトリのAptを作って .deb だけを落とす方法。ホストのApt状態は汚れない。
+
+1) オフラインPC②から sources を持ってくる
+
+/etc/apt/sources.list と /etc/apt/sources.list.d/*.list をUSBでオンラインPCへ。
+
+2) オンラインPCで取得スクリプト（コピペOK）
+
+# オンラインPC
+mkdir -p ~/apt-dl/{etc/apt,sources.list.d,cache/archives,state}
+cp /path/from/usb/sources.list ~/apt-dl/etc/apt/sources.list
+# 追加の .list があれば：
+# cp /path/from/usb/*.list ~/apt-dl/etc/apt/sources.list.d/
+
+cd ~/apt-dl
+sudo apt-get \
+  -o Dir::Etc::sourcelist=./etc/apt/sources.list \
+  -o Dir::Etc::sourceparts=./etc/apt/sources.list.d \
+  -o Dir::State=./state \
+  -o Dir::Cache=./cache \
+  update
+
+sudo apt-get \
+  -o Dir::Etc::sourcelist=./etc/apt/sources.list \
+  -o Dir::Etc::sourceparts=./etc/apt/sources.list.d \
+  -o Dir::State=./state \
+  -o Dir::Cache=./cache \
+  --download-only --reinstall install sudo
+# sudo-ldap も必要なら同様に --download-only --reinstall install sudo-ldap
+
+mkdir -p ~/sudo_debs && cp cache/archives/*.deb ~/sudo_debs/
+
+あとは 方式Aと同じで、~/sudo_debs をオフラインPC②→①へ持っていき、sudo apt install -y ./*.deb。
+
+⸻
+
+どちらにも共通の注意（お手軽運用の最小限）
+	•	リリース（codename）とアーキテクチャを必ず合わせる（24.04/nobleと22.04/jammyを混ぜない、amd64想定）。
+	•	オフライン側確認：
+source /etc/os-release; echo "$VERSION_CODENAME"; dpkg --print-architecture
+	•	先に sudo-ldap を消さない。 競合時のみ sudo apt remove sudo-ldap → もう一度 apt install ./*.deb。
+	•	検証は オフラインPC②で必ず：
+sudo --version, visudo -c, dpkg -l sudo | grep ^ii
+	•	万一に備え、今のsudoの .deb も控えておくとロールバックが楽（apt-get download sudo で現行版を保存）。
+
+⸻
+
+「最短で済ませたい」なら **方式A（Dockerワンライナー）**が一押し。Dockerが無理なら 方式Bで十分運用できます。
+あなたのUbuntuリリース（22.04 / 24.04 など）を教えてくれたら、その版にピタッと合わせたコマンドだけを短く出すよ。
+
+
+
+
+
+
+
+==========
+
+オフラインPC①とオフラインPC②が必ず同一環境で可能性がある場合、sudo、及び依存パッケージをインストールする方法はあるか？
+
+
+---
+
+はい、PC①/PC②が同一環境（同じUbuntu版・アーキ・sources）なら、試験で通ったものをそのまま本番に流用できます。やり方は2通り。どちらも「PC②で検証 → 同一物をPC①へ適用」です。
+
+⸻
+
+方法A（おすすめ・安全寄り）：apt-offline の同一バンドルを使い回す
+
+同じ zip をPC②とPC①で使うだけなのでズレが出にくいです。
+
+PC②（オフライン・試験）
+
+# 署名作成（sudoだけ更新）
+sudo apt-offline set ~/sudo.sig --update --upgrade --install-packages sudo
+# sudo-ldapも一緒なら: --install-packages sudo,sudo-ldap
+
+オンラインPC
+
+sudo apt-offline get ~/sudo.sig --bundle ~/sudo_bundle.zip
+
+PC②（検証適用）
+
+sudo apt-offline install ~/sudo_bundle.zip
+sudo apt install -y sudo    # 必要なら sudo-ldap も併せて
+sudo --version && visudo -c
+
+PC①（本番適用：同じzipを持参して同じ操作）
+
+sudo apt-offline install ~/sudo_bundle.zip
+sudo apt install -y sudo
+sudo --version && visudo -c
+
+ポイント
+	•	同一zipなので、PC②で通ればPC①でも再現性が高い。
+	•	リポ署名検証が効くので改ざん検知の観点でも良好。
+
+⸻
+
+方法B（もっと手軽）：PC②で使った .deb 一式をそのままPC①へ
+
+apt install ./*.deb はローカルの依存解決をしてくれるので、PC②とPC①が同一なら同じセットでそのまま入ります。
+
+オンラインPC（取得。Dockerがあれば最短）
+
+# 例：Ubuntu 24.04（noble）。22.04なら ubuntu:22.04 に置換
+mkdir -p ~/sudo_debs && cd ~/sudo_debs
+docker run --rm -v "$PWD":/out ubuntu:24.04 bash -lc '
+  set -e
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get -y --download-only install sudo
+  cp -a /var/cache/apt/archives/*.deb /out/
+'
+# sudo-ldapが本番に入っているなら、同様に --download-only install sudo-ldap も追加して取得
+
+PC②（検証適用）
+
+cd /mnt/usb/sudo_debs
+sudo apt install -y ./*.deb
+sudo --version && visudo -c
+
+PC①（本番適用：PC②で使った“同じ .deb セット”をそのまま）
+
+cd /mnt/usb/sudo_debs
+sudo apt install -y ./*.deb
+sudo --version && visudo -c
+
+ポイント
+	•	同一環境であれば依存も一致するので、同じ .deb セットで再現可能。
+	•	収集時のUbuntuタグはPC①/②のリリースに合わせる（例：22.04=ubuntu:22.04、24.04=ubuntu:24.04）。
+	•	署名検証の堅さは方法Aに劣るが、手軽さは高い。
+
+⸻
+
+最小限の注意
+	•	sudo-ldapは先に消さない。 競合が出たときだけ sudo apt remove sudo-ldap → もう一度 apt install ./*.deb。
+	•	同一条件の確認：source /etc/os-release; echo $VERSION_CODENAME; dpkg --print-architecture がPC①/②で一致していること。
+	•	念のため PC②で成功した .deb セットをハッシュ固定してPC①へ（例：sha256sum *.deb > SHA256SUMS、PC①で sha256sum -c）。
+
+⸻
+
+迷ったら**方法A（apt-offline同一バンドル）**がより安全、**方法B（.deb使い回し）**が最短です。リリース（22.04 or 24.04 など）を教えてくれたら、コマンドをその版にピタッと合わせて短縮版を出します。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
