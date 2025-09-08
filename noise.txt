@@ -207,3 +207,10 @@ save_librosa_spectrogram_image(E_norm, FS, "E_spectrogram.png")
 
 
 
+
+uv venv
+.\.venv\Scripts\Activate.ps1
+uv lock --upgrade --torch-backend=auto   # GPU向けに再解決してuv.lockを更新
+uv sync                                   # ロックに従って再インストール
+
+
