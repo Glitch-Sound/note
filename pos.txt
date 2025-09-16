@@ -1,0 +1,215 @@
+Pythonでの位置合わせの手法を教えて欲しい
+
+とある目標を1枚決め、その他の画像を目標になるべく近い位置に設定したい
+位置ズレは縦横方向、回転など含まれるが、ある程度大まかには手動で合わせている状態となる
+
+
+
+===
+
+
+
+いいね、その状況なら「粗合わせ済み→高精度合わせ」の王道フローがハマります。Pythonなら主にこの3系統が実用的です（上から順に試すのがおすすめ）：
+	1.	強度ベース（ECC）：速くて頑丈。回転/並進（必要ならアフィンや射影）までOK
+	2.	特徴点ベース（ORB/SIFT + RANSAC）：模様が豊富・露出差がある時に強い。射影歪みも吸収可
+	3.	位相相関：超高速。基本は平行移動、拡張で回転・スケールも推定可能（ログ極座標法）
+
+⸻
+
+まず「何のモデルで合わせるか」
+	•	平面で撮影・遠近が小さい → ほぼ Similarity（回転+並進+等方スケール） か Affine
+	•	斜め撮りや視点が違う → Homography（射影）
+	•	ゴムのように変形している → 非剛体（光フロー/TPS/elastic）
+
+あなたの前提（大まかに手動合わせ済み、ズレは縦横・回転中心）なら、まずは ECC（回転+並進 or Affine） が一番ラクです。
+
+⸻
+
+手法①：ECCでがっちり合わせ（OpenCV）
+
+粗合わせ済みなら最有力。グレースケール化→正規化→ピラミッドで粗→細の順に最適化すると安定します。
+
+import cv2
+import numpy as np
+
+def ecc_align(mov_bgr, ref_bgr, mode="euclidean", mask=None, n_levels=3, iters=500, eps=1e-6):
+    """
+    mode: "translation" | "euclidean"(回転+並進) | "affine" | "homography"
+    mask: 注目領域(白)の8bitマスク (ref画像と同サイズ)。不要ならNoneでOK
+    """
+    warp_mode_map = {
+        "translation": cv2.MOTION_TRANSLATION,
+        "euclidean":   cv2.MOTION_EUCLIDEAN,  # 回転+並進
+        "affine":      cv2.MOTION_AFFINE,     # せん断込み
+        "homography":  cv2.MOTION_HOMOGRAPHY  # 射影
+    }
+    warp_mode = warp_mode_map[mode]
+
+    # 前処理：グレースケール&0-1正規化
+    def prep(img):
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        return cv2.normalize(g, None, 0, 1, cv2.NORM_MINMAX)
+
+    ref_full = prep(ref_bgr)
+    mov_full = prep(mov_bgr)
+
+    # 初期ワープ行列
+    if warp_mode == cv2.MOTION_HOMOGRAPHY:
+        W = np.eye(3, dtype=np.float32)
+    else:
+        W = np.eye(2, 3, dtype=np.float32)
+
+    # 画像ピラミッド作成（粗→細）
+    pyr_scale = [1/(2**l) for l in range(n_levels-1, -1, -1)]
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, iters, eps)
+
+    for s in pyr_scale:
+        ref = cv2.resize(ref_full, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        mov = cv2.resize(mov_full, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        msk = None if mask is None else cv2.resize(mask, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        # スケールに応じて初期Wを拡縮
+        if warp_mode == cv2.MOTION_HOMOGRAPHY:
+            W_scaled = W.copy()
+            W_scaled[0,2] *= s
+            W_scaled[1,2] *= s
+        else:
+            W_scaled = W.copy()
+            W_scaled[:,2] *= s
+
+        try:
+            cc, W_opt = cv2.findTransformECC(
+                ref, mov, W_scaled, warp_mode, criteria,
+                inputMask=msk, gaussFiltSize=5
+            )
+            W = W_opt
+        except cv2.error:
+            # 収束失敗時はそのまま次レベルへ
+            pass
+
+    # 最終ワープを元サイズに適用（カラーで適用）
+    h, w = ref_full.shape
+    if warp_mode == cv2.MOTION_HOMOGRAPHY:
+        aligned = cv2.warpPerspective(mov_bgr, W, (w, h),
+                                      flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                      borderMode=cv2.BORDER_CONSTANT)
+    else:
+        aligned = cv2.warpAffine(mov_bgr, W, (w, h),
+                                 flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                 borderMode=cv2.BORDER_CONSTANT)
+    return aligned, W
+
+使い方（Similarityに近い挙動が欲しければまずは "euclidean"、スケールも吸収したければ "affine"）:
+
+ref = cv2.imread("reference.png")
+mov = cv2.imread("moving.png")
+aligned, W = ecc_align(mov, ref, mode="euclidean")  # or "affine"
+cv2.imwrite("aligned.png", aligned)
+
+コツ
+	•	大きな露出差があるなら、画像をSobel/LoGでエッジ画像にしてからECCするのが効くことあり
+	•	ノイズや動体がある部分は mask で無視
+	•	うまくいかない時はまず mode="translation" → "euclidean" → "affine" と段階的に
+
+⸻
+
+手法②：特徴点（ORB/SIFT）+ RANSAC
+
+写っている模様が多い/照明差が大きい/視点違いがあるならこちらが安定。
+Similarity を推定したいなら estimateAffinePartial2D、斜め撮りまで吸収したいなら findHomography。
+
+import cv2
+import numpy as np
+
+def feature_align(mov_bgr, ref_bgr, model="similarity"):  # "similarity" | "homography"
+    ref_g = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY)
+    mov_g = cv2.cvtColor(mov_bgr, cv2.COLOR_BGR2GRAY)
+
+    # ORBは特許フリーで速い（SIFTが必要ならSIFT_create()へ）
+    orb = cv2.ORB_create(nfeatures=5000)
+    kp1, des1 = orb.detectAndCompute(ref_g, None)
+    kp2, des2 = orb.detectAndCompute(mov_g, None)
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    knn = bf.knnMatch(des1, des2, k=2)
+    good = [m for m,n in knn if m.distance < 0.75*n.distance]  # Lowe比
+
+    if len(good) < 6:
+        raise RuntimeError("対応点が少なすぎます")
+
+    pts_ref = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+    pts_mov = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+
+    h, w = ref_g.shape
+
+    if model == "homography":
+        H, inl = cv2.findHomography(pts_mov, pts_ref, cv2.RANSAC, 3.0)
+        aligned = cv2.warpPerspective(mov_bgr, H, (w, h), flags=cv2.INTER_LINEAR)
+        M = H
+    else:
+        # Similarity/回転+並進+等方スケール（部分アフィン）
+        M, inl = cv2.estimateAffinePartial2D(pts_mov, pts_ref, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+        aligned = cv2.warpAffine(mov_bgr, M, (w, h), flags=cv2.INTER_LINEAR)
+
+    return aligned, (M, inl)
+
+
+⸻
+
+手法③：位相相関（高速）
+	•	平行移動のみなら skimage.registration.phase_cross_correlation が最速・高精度（サブピクセル）
+	•	回転/スケールも推定するなら「フーリエ振幅→ログ極座標→位相相関」の定番手法（コードは少し長くなる）。
+粗合わせ済みなら、まず平行移動だけ位相相関→残差をECCで詰める、と段階分けもアリ。
+
+import numpy as np
+from skimage import io, color
+from skimage.registration import phase_cross_correlation
+from skimage.transform import warp, AffineTransform
+
+def translate_align(mov, ref):
+    # mov/ref: 2D float or gray
+    shift, error, phasediff = phase_cross_correlation(ref, mov, upsample_factor=10)
+    # shift = (dy, dx)
+    tform = AffineTransform(translation=(-shift[1], -shift[0]))
+    aligned = warp(mov, tform.inverse, preserve_range=True)
+    return aligned, shift
+
+
+⸻
+
+非剛体が必要な場合
+	•	光フロー（OpenCV Farnebäck / skimage.registration.optical_flow_tvl1）で密な変形場→remap/warp
+	•	医用レベルの多モーダルなら SimpleITK/elastix（MI, MattesMIなどのメトリク）
+
+⸻
+
+精度評価＆実運用のコツ
+	•	メトリク：SSIM/相関係数/ECCスコア。黒枠の影響を避けるため 共通有効領域で評価 する
+	•	前処理：グレースケール、ヒストグラム均一化（CLAHE）、軽い平滑化
+	•	ROIマスク：動く物や外周の余白を無視すると収束が安定
+	•	画像ピラミッド：低解像度→高解像度の順に合わせる（ECCも特徴点も吉）
+	•	補間：INTER_LINEAR でOK、精密用途は INTER_CUBIC、実行速度重視なら INTER_NEAREST
+	•	外れ値耐性：特徴点は RANSAC しきい値3px前後から調整
+	•	処理時間：位相相関（速） → ECC（中） → 特徴点+RANSAC（画像/特徴量次第）
+
+⸻
+
+最小実例（ECC→回転+並進）
+
+import cv2
+
+ref = cv2.imread("ref.jpg")
+mov = cv2.imread("mov.jpg")
+
+aligned, W = ecc_align(mov, ref, mode="euclidean")
+cv2.imwrite("aligned.jpg", aligned)
+
+
+⸻
+
+必要なら、あなたの画像サンプルの条件（撮影環境、歪みの種類、露出差、解像度）を想定して、どのモデル・パラメータから始めるかを具体数値込みでレシピ化します。たとえば「まず位相相関で±20pxを潰してからECC（euclidean, 500iter, 3段ピラミッド）」→「失敗時は特徴点（ORB 5000, ratio=0.75, RANSAC=3px）」という実務フローに落とし込めます。
+
+
+
+
+
