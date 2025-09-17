@@ -1,0 +1,50 @@
+了解！条件（FastFlow＋ViT／Python／商用可ライセンス／布地向け）に合うGitHub候補を、日本語でコンパクトにまとめました。まずはこの3本から検討すると良いです。
+
+⸻
+
+本命（導入しやすさ重視）
+
+Anomalib（FastFlow 実装あり）
+	•	リポジトリ：open-edge-platform/anomalib（PyTorch Lightning ベース） ￼
+	•	何ができる？：最新の異常検知アルゴリズム集。FastFlowを含み、ResNet/ViTなど任意の特徴抽出器と組み合わせ可能（＝ViT特徴でFastFlowが使える） ￼
+	•	使い勝手：CLI／API／チュートリアルが充実。学習・推論・ベンチマーク・OpenVINOエクスポートまで一通り揃っており、導入が早いです。 ￼
+	•	ライセンス：Apache-2.0（商用OK） ￼
+	•	データ対応：MVTec-AD などを標準サポート（※MVTec-ADのデータ自体は商用不可なので、自社データで再学習してください） ￼
+
+⸻
+
+軽量・素直なPyTorch実装（自分で触って拡張したい方向け）
+
+gathierry/FastFlow（PyTorch）
+	•	何ができる？：FastFlow 論文の非公式実装。DeiT/CaiT などViT系バックボーンのスコアをREADMEで提示（＝ViT特徴での動作実績あり）。カテゴリ「carpet」「leather」等のテクスチャでも高AUROC。 ￼
+	•	使い方：requirements.txt を入れて main.py で学習／評価。MVTec-ADをそのまま使える構成。 ￼
+	•	ライセンス：Apache-2.0（商用OK） ￼
+
+RistoranteRist/FastFlow（PyTorch）
+	•	何ができる？：FastFlowの別実装。FrEIAの改修で入力と同サイズのヤコビアンを出し、再現性に配慮。MVTec-ADの各カテゴリで高精度（carpet/leatherは画像レベルAUROC=1.00と明記）。 ￼
+	•	使い方：config.py でパス設定→python main.py。 ￼
+	•	ライセンス：MIT（商用OK） ￼
+
+補足：MVTec-ADは商用利用不可（CC BY-NC-SA 4.0）。検証には使えますが、商用品質データは自社布地画像で再学習してください。 ￼
+
+⸻
+
+参考（Paddle実装／PythonだがPyTorchでない）
+
+lelexx/fastflow_paddle
+	•	概要：PaddlePaddle版FastFlow。ResNet/ViTなど任意の特徴抽出器と組み合わせ可能と明記。学習・評価・推論・エクスポート一式。 ￼
+	•	ライセンス：Apache-2.0（商用OK） ￼
+
+⸻
+
+どれを選ぶ？（用途別のおすすめ）
+	•	最短で布地検査を動かしたい：AnomalibのFastFlow＋ViTを推奨。CLIと設定ファイルで素早く回せ、将来のモデル差し替え（PatchCore等）も容易です。 ￼
+	•	コードをシンプルに把握し自作拡張したい：gathierry 版（Apache-2.0） or RistoranteRist 版（MIT）。まずはViT（例：DeiT）設定でMVTecの「carpet」「leather」を再現→自社布地へ置換、の流れがスムーズ。 ￼
+
+⸻
+
+次の一手（最小ステップ）
+	1.	MVTec-ADの「carpet」「leather」でパイプライン検証（精度・速度・しきい値運用を把握）→ 自社布地データへ差し替え。 ￼
+	2.	ViTバックボーン選定：Anomalibなら設定でViTへ切替可能／素のPyTorch実装ならtimm等のViTを流用して特徴抽出→FastFlowへ投入する構成が定番。 ￼
+
+必要なら、**AnomalibのFastFlowをViTで学習する最小設定例（YAML）**や、gathierry版でDeiT/CaiTを使う具体的手順をこちらで書き起こします。
