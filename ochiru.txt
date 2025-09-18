@@ -1,0 +1,111 @@
+原因はだいたい「サーバ」「ネットワーク（NAT/FW/VPN/回線）」「クライアント（Tera Term/Windows）」のどこかにあります。手早く切り分けるためのチェックリストを置いておきます。上から順にやればOKです。
+
+1) まず現象の型を特定
+	•	何分くらいで切れる？
+きっかり 5〜15分 で落ちる → NAT/ファイアウォールのアイドルタイムアウト疑い
+不定期/負荷時だけ落ちる → 回線品質/ドライバ/カーネル/MTUなど
+	•	「放置中だけ」or「操作中/SCP中でも」切れる？（放置中だけならKeepAlive対策が効きやすい）
+	•	Tera Term以外（Windows PowerShellの ssh や PuTTY）でも落ちる？（クライアント依存か切り分け）
+
+2) サーバ側ログ・状態の確認（Ubuntu）
+
+# SSHサービスと認証ログ
+sudo journalctl -u ssh -S -2h
+sudo tail -n 200 /var/log/auth.log
+
+# カーネル/ネットワークの異常（リンク切れ、NICリセット等）
+dmesg -T | egrep -i 'eth|enp|link|reset|error|mtu|drop'
+
+# 切断直前直後のシステム全体ログも見る
+sudo tail -n 300 /var/log/syslog
+
+# 接続状態の観察（切断前に別セッションで実行）
+sudo ss -tanp | grep ':22'
+
+	•	auth.log に「Disconnected from」「timeout」「no matching cipher」等が出ていれば手がかり。
+	•	dmesg に NIC の link down/up や reset があれば物理/ドライバ側の問題。
+
+3) サーバ側のKeepAliveと周辺設定（即効性あり）
+
+/etc/ssh/sshd_config に以下を追記/有効化して再読み込みします。
+
+# アイドル対策（サーバ→クライアントに生存通知）
+ClientAliveInterval 60
+ClientAliveCountMax 3
+TCPKeepAlive yes
+# おまけ：名前解決待ちを避ける（接続時の遅さ対策）
+UseDNS no
+
+反映：
+
+sudo systemctl reload ssh
+
+TCPレベルのKeepAliveも短めに（NAT対策）：
+
+# 永続設定
+sudo tee /etc/sysctl.d/99-ssh-keepalive.conf >/dev/null <<'EOF'
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_intvl=60
+net.ipv4.tcp_keepalive_probes=5
+EOF
+sudo sysctl --system
+
+4) クライアント（Tera Term/Windows）側の対策
+	•	Tera Term：メニューの「Setup → SSH…」あたりにある KeepAlive/送信NOP（SSH2 keep-alive）を 60〜120秒 に設定。
+（名称はバージョンで多少違いますが、「NOPを送る」「keepalive interval」系の項目です）
+	•	Windowsの省電力でNICがスリープしないように：
+デバイスマネージャー → ネットワークアダプタ → プロパティ → 電源管理 → 「電力節約でオフにする」を無効化。
+可能ならPCの電源プランを「高パフォーマンス」に。
+	•	検証として、PowerShellのOpenSSHでも試す：
+ssh -vvv user@server（詳細ログで切断直前の挙動を確認）
+
+5) ネットワーク経路の健全性チェック
+	•	連続Ping：切断タイミングでロス/ジッタがないか
+
+ping -t <server>   # Windows
+
+
+	•	MTR/WinMTR：経路品質の可視化（パケットロスや不安定なホップを特定）
+
+sudo apt-get update && sudo apt-get install -y mtr-tiny
+mtr -rw <client-or-gateway>
+
+
+	•	パケットキャプチャ（RSTで落ちるか、ただ無通信でタイムアウトか）
+
+sudo tcpdump -i any tcp port 22 -n -vv
+
+切断瞬間に [RST] が見えれば途中機器が強制切断している可能性大。何も来ずに切れるならアイドルタイムアウトの線が濃いです。
+
+	•	MTU問題の切り分け（VPN配下で起きやすい）
+大きいSCPでだけ落ちる/固まるときはMTUを疑う。試しに一時的に小さく：
+
+sudo ip link set dev <IFNAME> mtu 1400
+
+
+
+6) ありがちな原因 → すぐ効く処方箋
+	•	アイドル数分で必ず切れる
+→ サーバClientAliveInterval=60、Tera TermのKeepAlive 60–120秒、TCP keepalive短縮。
+	•	Wi-FiやVPN経由だけ不安定
+→ WinMTRでロス確認、MTU調整、可能なら有線 or VPN外で比較。
+	•	大きな転送時だけ落ちる
+→ MTU/MSS、回線品質、途中FWのスキャン/遮断。scp -l で帯域制限し挙動比較も有効。
+	•	サーバのNIC/ドライバ由来
+→ dmesg にlink flapやreset、ethtool -S のエラー増。カーネル/NICドライバ更新やケーブル/ポート変更。
+
+7) 切断しても作業を守る運用小技
+	•	サーバ側で tmux/screen を使って作業。切れてもセッションは残るので被害最小。
+
+⸻
+
+もし次を教えてもらえれば、さらに絞り込めます：
+	1.	だいたい何分で切れるか／放置中だけか
+	2.	auth.log / syslog / dmesg に切断時刻付近で出ている行
+	3.	Tera TermのKeepAlive設定値
+
+必要なら、貼り付け用のコマンドをあなたの環境に合わせてもう少し最適化するね。
+
+
+
+
