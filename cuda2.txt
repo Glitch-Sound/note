@@ -144,3 +144,107 @@ docker compose run --rm yolov8 yolo detect val model=runs/detect/train/weights/b
 
 
 
+
+=====
+
+
+エラー理由：
+additional property gpus is not allowed は、使っている docker-compose が gpus: キーをサポートしていない（古い “docker-compose” CLI など）ために出ます。
+
+修正方法は2通りあります。環境を変えずに通すなら、**A（runtime: nvidia）**が最も確実です。
+（Dockerfile / requirements.txt はそのままでOK。差し替えは docker-compose.yaml だけです。）
+
+⸻
+
+A. 互換性優先（古い docker-compose CLI 向け）
+
+version: "3.8"
+services:
+  yolov8:
+    build: .
+    container_name: yolov8
+    working_dir: /workspace
+    volumes:
+      - ./workspace:/workspace
+    # 旧来方式：NVIDIA ランタイムを指定
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    shm_size: "8g"
+    tty: true
+    stdin_open: true
+
+メモ
+	•	runtime: nvidia は古い compose でも通る実績が高い方式です。
+	•	ホスト側に NVIDIA Container Toolkit が入っていることが前提です（未導入だと GPU は渡せません）。
+
+⸻
+
+B. 新しめの “docker compose”（V2 プラグイン）向け
+
+# version 行は省略してもOK（Compose Spec 準拠）
+services:
+  yolov8:
+    build: .
+    container_name: yolov8
+    working_dir: /workspace
+    volumes:
+      - ./workspace:/workspace
+
+    # 新方式：GPU をデバイスとして予約
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    shm_size: "8g"
+    tty: true
+    stdin_open: true
+
+注意
+	•	deploy: は従来の docker-compose では無視されることがあります。“docker compose”（スペースありの新コマンド）で使ってください。
+	•	例）docker compose up -d（OK） / docker-compose up -d（旧CLIだと無視される可能性）
+
+⸻
+
+どちらを使うべき？
+	•	まずは A（runtime: nvidia） に置き換えて実行 → 動けばそのままでOK。
+	•	もし “docker compose” V2 を使用しているなら B にしてもOK。
+
+⸻
+
+動作チェック（学習・推論の前に）
+
+# ビルド
+docker compose build     # 旧CLIなら: docker-compose build
+
+# GPUが見えるか確認
+docker compose run --rm yolov8 python -c "import torch; print('CUDA?', torch.cuda.is_available()); \
+import os; print('VISIBLE=', os.getenv('NVIDIA_VISIBLE_DEVICES'))"
+
+問題なければ、前回お渡ししたコマンドで学習/推論してください（例）：
+
+# 学習（YOLOv8nを例に）
+docker compose run --rm yolov8 yolo detect train model=yolov8n.pt data=datasets/data.yaml \
+  epochs=100 imgsz=640 batch=16 device=0
+
+# 推論
+docker compose run --rm yolov8 yolo detect predict model=runs/detect/train/weights/best.pt \
+  source=sample.jpg device=0
+
+
+⸻
+
+もしまだ同じエラーが出る場合は、実行に使っているコマンド（docker compose か docker-compose か） と docker compose version / docker-compose version の出力 を貼ってください。こちらで、あなたの環境に確実に合う最小修正を出します。
+
+
+
+
+
