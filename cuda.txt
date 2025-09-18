@@ -1,0 +1,119 @@
+上記はdockerfile, docker-compose, requirements.txtとなる
+本内容でceleryaサービス内でcudaは利用でき、かつgpu版のpytorchは動作するか？
+
+動作しない場合、どのように直したらよいか教えて欲しい
+
+
+========
+
+
+結論：
+そのままでは CUDA は使えません。そして torch==2.7.1 は PyPI から入るため CPU 版が入ります。さらに deploy.resources.reservations.devices は Swarm 用なので、通常の docker compose up では 無視され GPU が割り当てられません。
+
+下の手順どちらかで直してください（A=最小変更、B=堅牢版）。どちらも共通で「ホスト側に NVIDIA ドライバ + nvidia-container-toolkit が入っていること」は前提です。
+
+⸻
+
+A. 最小変更（今のベースイメージのまま動かす）
+
+1) docker-compose.yml を修正（GPU を明示）
+
+services:
+  celerya:
+    build: .
+    container_name: ai-pf_celery_worker
+    command: celery -A celery_app:celery_app worker --concurrency=1 --loglevel=info -n worker1@%h --pool=solo -Q sque
+    gpus: all                      # ← これが肝
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONPATH=/app
+    volumes:
+      - ./app:/app                 # 可能なら相対パスに修正（/app:/app だとホストの /app を刺してしまう）
+    depends_on:
+      - redisservice
+  redisservice:
+    image: redis:alpine
+    container_name: ai-pf_redisservice
+    ports: ["6379:6379"]
+
+2) GPU 版 PyTorch を入れる
+
+やり方は2通り。どちらか1つでOK。
+
+(a) requirements.txt を修正
+
+--extra-index-url https://download.pytorch.org/whl/cu121   # 例：ドライバが CUDA 12.1 系を満たす場合
+torch==2.4.1+cu121
+# 必要なら
+# torchvision==0.19.1+cu121
+# torchaudio==2.4.1+cu121
+
+fastapi==0.116.1
+celery[redis]==5.5.3
+uvicorn==0.35.0
+redis==5.2.1
+ultralytics==8.3.170
+opencv-python-headless==4.12.0.88   # ← headless だけに統一（opencv-python と重複はNG）
+httpx==0.28.1
+minio==7.2.16
+mlflow==3.1.4
+onnx==1.18.0
+# onnxruntime は GPU を使いたいなら onnxruntime-gpu に変更（任意）
+# onnxruntime-gpu==1.19.2
+coloredlogs==15.0.1
+cvat_sdk==2.43.0
+python-dotenv==1.0.1
+
+(b) Dockerfile で torch だけ先に個別インストール
+
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsm6 libxext6 && rm -rf /var/lib/apt/lists/*
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu121 \
+      torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121 \
+ && pip install --no-cache-dir -r requirements.txt
+COPY app/ .
+CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000"]  # compose 側で celery に上書きされるのでこのままでOK
+
+※ cu121 の部分はホストのドライバに合わせて選んでください（例：cu118 / cu121 など）。合わないと起動時に CUDA エラーになります。
+
+⸻
+
+B. 推奨（より堅牢）：CUDA ベースイメージを使う
+
+PyTorch の CUDA ランタイムをイメージに含めたい場合。
+
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04  # 例
+RUN apt-get update && apt-get install -y python3-pip python3-dev ffmpeg libsm6 libxext6 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN python3 -m pip install --upgrade pip \
+ && python3 -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu121 \
+      torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121 \
+ && python3 -m pip install --no-cache-dir -r requirements.txt
+COPY app/ .
+
+compose 側は A と同じく gpus: all を付けます。
+
+⸻
+
+動作確認（Celery ワーカー内で）
+
+docker compose run --rm celerya python -c "import torch;print('torch',torch.__version__,'CUDA?',torch.cuda.is_available()); \
+print('device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-')"
+
+CUDA? True と GPU 名が出れば OK。
+
+⸻
+
+補足チェックリスト
+	•	ホストで nvidia-smi が動く（ドライバ OK）。
+	•	docker run --rm --gpus all nvidia/cuda:12.1.1-base-ubuntu22.04 nvidia-smi で GPU がコンテナに渡せる。
+	•	opencv-python と opencv-python-headless は どちらか片方 にする（サーバなら headless 推奨）。
+	•	ONNX を GPU で使う予定なら onnxruntime-gpu を検討。
+	•	volumes: - ./app:/app に直すか、ボリュームを外して ビルドしたコードを使う（今の /app:/app はホストの /app を誤ってマウントします）。
+
+この修正で、celerya サービス内から CUDA と GPU 版 PyTorch が利用可能になります。
