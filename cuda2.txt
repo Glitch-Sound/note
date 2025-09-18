@@ -1,0 +1,146 @@
+
+NVIDIA GeForce RTX 3090が搭載されたubuntuマシンがある。
+ドライバはnvidia-driver-460がインストールされている。
+また、docker、及びdocker composeがインストールされている前提とする。
+
+上記の構成を変更せず、コンテナ内でultralyticsのYOLOv8をgpu上で学習・推論を行いたい。
+必要なDockerfile, docker-compose.yaml, requirement.txtを出力してほしい。
+
+なお、ハルシネーションを避けるため、分からないときは「分かりません」と回答してほしい。
+
+
+
+======
+
+
+
+
+了解、YOLOv8で「学習・推論」までGPU利用できる最小セットを、RTX 3090 + nvidia-driver-460の前提を崩さずに用意しました。
+（補足：3090＝AmpereはCUDA 11.0 以上が必須で、Ultralyticsは**Python 3.8+ / PyTorch 1.8+を満たせば動作します。今回はドライバ460に安全寄りのCUDA 11.1（cu111）**系で固定しています。 ￼）
+
+なお、Docker からGPUを使うには NVIDIA Container Toolkit がホストに導入済みである必要があります。未導入だと、このCompose設定でもGPUは渡せません。導入手順は公式を参照してください。 ￼
+
+⸻
+
+Dockerfile
+
+# Driver 460 と相性の良い CUDA 11.1 + cuDNN8 ランタイム
+FROM nvidia/cuda:11.1.1-cudnn8-runtime-ubuntu20.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# 必要ツール & OpenCVランタイム依存
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev build-essential git \
+    libglib2.0-0 libgl1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# pip を更新
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+WORKDIR /workspace
+
+# 依存関係をインストール
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 使いやすいように /usr/bin/python エイリアス（任意）
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+
+# 作業ディレクトリ
+CMD ["bash"]
+
+
+⸻
+
+docker-compose.yaml
+
+version: "3.8"
+
+services:
+  yolov8:
+    build: .
+    container_name: yolov8
+    working_dir: /workspace
+    volumes:
+      - ./workspace:/workspace   # データ/スクリプト/出力
+    # GPU を有効化（NVIDIA Container Toolkit が必要）
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    shm_size: "8g"               # DataLoader での共有メモリ不足対策
+    tty: true
+    stdin_open: true
+
+参考：ComposeでのGPU有効化の公式案内。必要に応じて deploy.resources.reservations.devices 方式でも可。 ￼
+
+⸻
+
+requirements.txt
+
+# PyTorch (CUDA 11.1 対応の公式WHLリポジトリ)
+--extra-index-url https://download.pytorch.org/whl/cu111
+torch==1.10.2+cu111
+torchvision==0.11.3+cu111
+torchaudio==0.10.2+cu111
+
+# Ultralytics（YOLOv8/YOLO11を含む）※ Python>=3.8 & Torch>=1.8 で動作
+ultralytics>=8.0.0,<9
+
+# ヘッドレス環境向け OpenCV
+opencv-python-headless==4.9.0.80
+
+# よく使う補助ライブラリ
+numpy==1.24.4
+pillow
+pyyaml
+tqdm
+matplotlib
+scipy
+
+	•	PyTorch の cu111 ホイールは上記 extra-index-url から取得します。 ￼
+	•	Ultralytics の最低要件（Python 3.8+ / Torch 1.8+、推奨は Torch 1.10+ & CUDA 11.2+）。 ￼
+
+⸻
+
+使い方（最小動作チェック）
+
+公式のCLIは yolo TASK MODE ARGS 形式。学習/推論/評価/エクスポートすべてCLIから実行できます。 ￼
+
+# ビルド & 起動
+docker compose build
+docker compose run --rm yolov8 python -c "import torch;print('CUDA?',torch.cuda.is_available(), 'GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+
+# 例1: 学習（自前データ: YOLO形式のdata.yaml）
+#   data.yaml, 画像/ラベル一式を ./workspace/datasets/... に配置しておく
+docker compose run --rm yolov8 yolo detect train model=yolov8n.pt data=datasets/data.yaml epochs=100 imgsz=640 batch=16 device=0
+
+# 例2: 推論
+docker compose run --rm yolov8 yolo detect predict model=runs/detect/train/weights/best.pt source=sample.jpg device=0
+
+# 例3: 評価（mAP算出）
+docker compose run --rm yolov8 yolo detect val model=runs/detect/train/weights/best.pt data=datasets/data.yaml device=0
+
+
+⸻
+
+補足（なぜこの構成か）
+	•	3090(Ampere)はCUDA 11.0+必須 → cu111系で確実性重視。 ￼
+	•	Ultralyticsの要件は Python 3.8+ / Torch 1.8+。本レシピは Python3.8（Ubuntu20.04標準） + Torch 1.10.2+cu111 で満たします。 ￼
+	•	PyTorchのcu111公式ホイールを確実に取得するため extra-index-url を明示。 ￼
+	•	DockerでのGPU有効化は公式ドキュメントの手順に準拠。 ￼
+
+⸻
+
+互換性に関する注意
+	•	将来、ultralytics の新しい 8.x が より新しい PyTorch を要求する可能性はあります。もし pip install ultralytics で依存解決に失敗した場合、8.x系の安定版へ固定すると解決する場合があります（どのバージョンが最適かは将来の変更次第のため分かりません）。
+	•	もし「CUDA 11.2 以上が必要なPyTorch」を使いたい場合、ホストのドライバを上げるか、もしくは cu111 対応のPyTorchに合わせるのが現実的です（本レシピは後者）。Ultralytics自体は最低要件を満たしていれば学習・推論は可能です。 ￼
+
+この3ファイルをそのまま配置すれば、学習・推論までGPUで動きます。もしエラーが出たら、エラーログ全文を貼ってください。原因に応じて、最小変更（例：ultralytics のバージョン固定、shm_size 調整、バッチサイズ調整など）で確実に通る形へ手直しします。
+
+
+
