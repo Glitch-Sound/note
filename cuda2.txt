@@ -248,3 +248,82 @@ docker compose run --rm yolov8 yolo detect predict model=runs/detect/train/weigh
 
 
 
+=====
+
+
+結論：はい、No matching distribution found for onnxruntime-gpu==1.8.1 は正しいエラーです。
+理由は2つあります。
+	1.	PyPI から古い GPU ホイールが順次削除されており、1.8.1 も削除済み（今は pip で取れません）。 ￼
+	2.	そもそも 1.8.x のホイールは Python 3.6–3.9 向けで、3.10 以降では合致するビルドがありません（結果として “no matching”）。これは一般的な事象で、PyPI 側のファイル一覧にも現れます。 ￼
+
+さらに補足：
+	•	1.18.x は CUDA 11.8 向けで、最小ドライバは 520.61.03 以上が必要です。いまの driver=460 では CUDAExecutionProvider が初期化できず CPU にフォールバックします。 ￼
+	•	そして 現在の ONNX Runtime は“CUDA 11.x 用の GPU パッケージを PyPI に公開していない”（CUDA 12.x 向けのみ）。古い 11.x 向けは整理され、入手が難しくなっています。 ￼
+
+⸻
+
+取れる選択肢（確実に通る2パターン）
+
+A) ドライバを更新できる場合（最短）
+	•	NVIDIA ドライバを ≥ 520.61.03 に更新 → onnxruntime-gpu==1.18.0 をそのまま pip install。
+これは ORT 公式の「CUDA 11.8 は 11.x 系に互換（minor version compatibility）」という方針にも沿います。 ￼
+
+pip uninstall -y onnxruntime onnxruntime-gpu
+pip install onnxruntime-gpu==1.18.0
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+# → 'CUDAExecutionProvider' が出ればOK
+
+B) 構成（driver=460）を変えない場合
+	•	CUDA 11.2 / cuDNN8 の“devel”イメージ上で ONNX Runtime をソースビルドします。
+これなら **driver=460（=CUDA 11.2 世代対応）**のまま GPU版 ORT ホイールを自前で作れます。公式のビルド手順に準拠します。 ￼
+
+最小例（Docker 内で実行）:
+
+# 例: CUDA 11.2 + cuDNN8 の開発環境
+docker run --rm -it --gpus all nvidia/cuda:11.2.2-cudnn8-devel-ubuntu20.04 bash
+
+# 依存導入
+apt-get update && apt-get install -y git python3-dev python3-pip build-essential cmake
+python3 -m pip install --upgrade pip
+
+# ソース取得 & ビルド（CUDA EP 有効、Python wheel 作成）
+git clone --recursive https://github.com/microsoft/onnxruntime.git
+cd onnxruntime
+./build.sh --config Release --update --build --parallel --build_wheel \
+  --use_cuda --cuda_home /usr/local/cuda --cudnn_home /usr/lib/x86_64-linux-gnu
+
+# ホイールをインストール
+python3 -m pip install build/Linux/Release/dist/onnxruntime_gpu-*.whl
+
+python3 - <<'PY'
+import onnxruntime as ort
+print("providers:", ort.get_available_providers())
+PY
+# → ['CUDAExecutionProvider', 'CPUExecutionProvider'] などが出ればOK
+
+※ ビルド方法は公式「Build from source / Build with different EPs」を参照。（上は Linux x86_64 前提の最短例） ￼
+
+⸻
+
+どちらを選ぶべき？
+	•	速さ重視なら A（ドライバ更新→1.18.0）。
+	•	ホスト構成を絶対に変えないなら B（ソースビルド）。
+現状では PyPI から“そのまま取れる”CUDA 11.x 対応の GPU 版 ORT は実質ありません。 ￼
+
+⸻
+
+参考リンク（根拠）
+	•	「CUDA 11.8 の最小ドライバ＝520.61.03」：CUDA 11.8 Release Notes（表2/表3）。 ￼
+	•	「CUDA 11.x との minor version 互換の説明」：ORT CUDA EP ドキュメント。 ￼
+	•	「CUDA 11.x 向け GPU パッケージは既に公開停止」：ORT releases のアナウンス。 ￼
+	•	「古い onnxruntime-gpu パッケージの PyPI からの削除」：ロードマップ/削除履歴。 ￼
+
+⸻
+
+必要なら、B 案の Dockerfile/compose ひな型や、ビルド済み wheel を ホストに出すコマンドもすぐ出します。どちらの方針にしますか？（※この回答内では環境を勝手に変更しません）
+
+
+
+
+
+
