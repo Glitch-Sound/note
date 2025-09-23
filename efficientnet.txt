@@ -284,3 +284,287 @@ valデータ 正解率: 86.67% (26/30)
 他にも「クラスごとの正解率」や「推論失敗画像のリスト化」など必要であれば、どんどんご要望ください！
 
 
+
+======
+
+
+
+
+[system]
+あなたは物体検出の学習ログを診断し、性能改善のための実験計画を提案するアシスタントです。
+内部の思考過程は出力しないでください。出力は日本語の **JSONのみ** で返してください。
+各提案には、変更するパラメータ・データ操作・期待効果・停止条件（中止基準）を **必ず数値で** 記載してください。
+
+[assistant]
+了解しました。出力は JSON のみで返します。
+
+[user]
+# === 例1（COCO系・中規模・mAP頭打ち） ===
+<INPUT>
+{
+  "task": "detection",
+  "model": {"name": "YOLOv5-Like", "backbone": "CSPNet", "neck": "FPN+PAN"},
+  "dataset": {
+    "name": "Retail-COCO",
+    "num_images_train": 32000,
+    "num_images_val": 4000,
+    "num_classes": 20,
+    "img_size_train": 640,
+    "img_size_val": 640,
+    "class_freq_top3": [["bottle", 0.28], ["can", 0.21], ["box", 0.16]],
+    "long_tail": "moderate"
+  },
+  "hardware": {"gpu_mem_gb": 24, "latency_ms_budget": 25},
+  "hyperparams": {
+    "optimizer": "AdamW",
+    "lr": 0.0012,
+    "batch_size": 32,
+    "epochs": 120,
+    "weight_decay": 0.05,
+    "scheduler": "cosine",
+    "warmup_epochs": 3,
+    "img_aug": ["HSV", "RandomHorizontalFlip(p=0.5)", "Mosaic(p=0.5)", "MixUp(p=0.15)"],
+    "ema": true,
+    "iou_loss": "CIoU",
+    "cls_loss": "BCE",
+    "obj_loss": "BCE",
+    "nms_iou": 0.6,
+    "conf_thres": 0.25
+  },
+  "anchors": {"auto_anchoring": true, "num_anchors_per_level": 3},
+  "results": {
+    "epoch_last": 120,
+    "train_loss_last": 0.78,
+    "val_loss_last": 0.92,
+    "map_50_95_last": 0.472,
+    "map_50_last": 0.675,
+    "best_map_50_95": 0.478,
+    "per_class_ap_50_95": {"bottle":0.61, "can":0.55, "box":0.47, "others_mean":0.41},
+    "val_ar_1": 0.61,
+    "val_ar_10": 0.73,
+    "precision": 0.70,
+    "recall": 0.67,
+    "error_modes": ["小物体の見逃し", "近接クラス(bottle/can)の混同"],
+    "events": ["no_nan","no_oom"]
+  },
+  "previous_ablation": [
+    {"name":"img_size_640->800","delta_map_50_95":"+0.4pt","latency_ms","+6ms"},
+    {"name":"Mosaic 0.5->0.2","delta_map_50_95":"-0.3pt"}
+  ],
+  "constraints": {"throughput_fps_min": 30, "max_params_million": 75},
+  "notes": "小物体のARが低い。混同クラスの境界が曖昧。"
+}
+</INPUT>
+<OUTPUT>
+{
+  "diagnosis": "mAP@50-95が頭打ち。小物体再現率と近接クラス分離がボトルネック。FPN段の解像度/アンカー適合と分類マージンが鍵。",
+  "topline_goal": "mAP@50-95 +1.5pt、小物体AR+3pt、bottle/can混同を-20%",
+  "plan": [
+    {
+      "title": "小物体強化: 解像度とピラミッド増強",
+      "changes": [
+        {"param": "img_size_train", "from": 640, "to": 768},
+        {"param": "batch_size", "from": 32, "to": 24},
+        {"param": "neck", "from": "FPN+PAN", "to": "FPN+PAN+P2"},
+        {"param": "nms_iou", "from": 0.6, "to": 0.65}
+      ],
+      "data_ops": ["Mosaic(p=0.6, small-object-biased)", "RandomCrop(small_obj_focus, p=0.3)"],
+      "expected_effect": "高周波特徴の保持で小物体AR↑、近接物の抑制。",
+      "stop_criteria": "5エポックでmAP@50-95 +0.6pt未満なら中止",
+      "priority": 1
+    },
+    {
+      "title": "アンカー再最適化 + 判別的分類損失",
+      "changes": [
+        {"param": "auto_anchoring", "from": true, "to": "k-means(9) with small-object weighting"},
+        {"param": "cls_loss", "from": "BCE", "to": "Focal(γ=2.0)"},
+        {"param": "lr", "from": 0.0012, "to": 0.0009}
+      ],
+      "data_ops": [],
+      "expected_effect": "小物体適合＆クラスマージン拡大で混同低減。",
+      "stop_criteria": "6エポックでbottle/canのF1 +2pt未満なら中止",
+      "priority": 2
+    },
+    {
+      "title": "ラベル品質と閾値最適化",
+      "changes": [
+        {"param": "label_smoothing", "from": 0.0, "to": 0.05},
+        {"param": "conf_thres", "from": 0.25, "to": "0.20~0.35 grid-search"}
+      ],
+      "data_ops": ["box jitter(±2px) on minority classes"],
+      "expected_effect": "誤検出と見逃しのトレード改善、混同の緩和。",
+      "stop_criteria": "grid 10点でmAP@50最良が+0.8pt未満なら中止",
+      "priority": 3
+    }
+  ],
+  "ablation_order": ["小物体強化: 解像度とピラミッド増強", "アンカー再最適化 + 判別的分類損失", "ラベル品質と閾値最適化"],
+  "risk_notes": ["img_size↑はレイテンシ悪化→batchで吸収", "Focal過強でリコール低下の可能性あり"],
+  "self_check": {"specificity_0to5": 5, "consistency_0to5": 5, "actionability_0to5": 5}
+}
+</OUTPUT>
+
+# === 例2（産業系・長辺固定・高リコール要求） ===
+<INPUT>
+{
+  "task": "detection",
+  "model": {"name": "YOLOX-M", "backbone": "CSPDarknet", "neck": "PAFPN"},
+  "dataset": {
+    "name": "Factory-Line",
+    "num_images_train": 12000,
+    "num_images_val": 1500,
+    "num_classes": 6,
+    "img_size_train": 1024,
+    "img_size_val": 1024,
+    "object_size_profile": {"small(<32px)": 0.52, "medium(32-96px)": 0.38, "large(>96px)": 0.10},
+    "aspect_ratio": "long-edge-fixed"
+  },
+  "hardware": {"gpu_mem_gb": 16, "latency_ms_budget": 35},
+  "hyperparams": {
+    "optimizer":"SGD(momentum=0.9)",
+    "lr": 0.01,
+    "batch_size": 12,
+    "epochs": 80,
+    "weight_decay": 0.0005,
+    "scheduler": "cosine",
+    "warmup_epochs": 5,
+    "img_aug": ["Mosaic(0.5)","MixUp(0.1)","RandomAffine(±5°)"],
+    "ema": true,
+    "iou_loss": "GIoU",
+    "nms_iou": 0.5,
+    "conf_thres": 0.2
+  },
+  "anchors": {"auto_anchoring": false, "preset": [[10,13],[16,30],[33,23],[30,61],[62,45],[59,119],[116,90],[156,198],[373,326]]},
+  "results": {
+    "epoch_last": 80,
+    "map_50_95_last": 0.518,
+    "recall": 0.84,
+    "precision": 0.71,
+    "val_ar_10": 0.79,
+    "small_obj_recall": 0.74,
+    "error_modes": ["細長い物体の端欠け検出漏れ","被り時の誤検出"]
+  },
+  "constraints": {"must_recall": 0.90, "latency_ms_budget": 35},
+  "notes": "優先はリコール。レイテンシは35ms以内厳守。"
+}
+</INPUT>
+<OUTPUT>
+{
+  "diagnosis": "高リコール要件下で小物体・細長物体が課題。NMSとアンカー形状のミスマッチが残る。",
+  "topline_goal": "recall 0.90 到達、mAP@50-95 +1.0pt維持、35ms以内",
+  "plan": [
+    {
+      "title": "NMS緩和 + TTA軽量化",
+      "changes": [
+        {"param":"nms_iou","from":0.5,"to":0.45},
+        {"param":"conf_thres","from":0.2,"to":0.15}
+      ],
+      "data_ops": ["test-time flip(TTA) off/on 比較"],
+      "expected_effect": "見逃し減（偽陽性は後段で抑制）。",
+      "stop_criteria": "2エポック相当のvalでrecall+2pt未満なら却下",
+      "priority": 1
+    },
+    {
+      "title": "アンカーの縦長適合",
+      "changes": [
+        {"param": "anchors", "from": "preset", "to": "k-means(12) aspect-ratio-aware"},
+        {"param": "lr", "from": 0.01, "to": 0.008}
+      ],
+      "data_ops": ["elongated box jitter(縦長±3%) on train"],
+      "expected_effect": "細長物体の適合性↑でrecall向上。",
+      "stop_criteria": "5エポックでsmall_obj_recall +3pt未満なら中止",
+      "priority": 2
+    },
+    {
+      "title": "小物体向け解像度+部分クロップ",
+      "changes": [
+        {"param": "img_size_train", "from": 1024, "to": 1280},
+        {"param": "batch_size", "from": 12, "to": 8}
+      ],
+      "data_ops": ["RandomCrop(長辺1280, p=0.3)"],
+      "expected_effect": "端欠け検出の感度↑。",
+      "stop_criteria": "3エポックでval_ar_10 +2pt未満なら中止",
+      "priority": 3
+    }
+  ],
+  "ablation_order": ["NMS緩和 + TTA軽量化", "アンカーの縦長適合", "小物体向け解像度+部分クロップ"],
+  "risk_notes": ["nms緩和でFP↑→conf最適化とクラス閾値で相殺", "img_size↑でレイテンシ悪化のリスク"],
+  "self_check": {"specificity_0to5": 5, "consistency_0to5": 5, "actionability_0to5": 5}
+}
+</OUTPUT>
+
+# === 実データをここに入れてください（この形式に合わせると最も安定します） ===
+<INPUT>
+{
+  "task": "detection",
+  "model": {"name": "<例: YOLOv8-M>", "backbone": "<例: CSPDarknet>", "neck": "<例: PAFPN>"},
+  "dataset": {
+    "name": "<任意>",
+    "num_images_train": 0000,
+    "num_images_val": 0000,
+    "num_classes": 0,
+    "img_size_train": 640,
+    "img_size_val": 640,
+    "object_size_profile": {"small(<32px)": 0.00, "medium(32-96px)": 0.00, "large(>96px)": 0.00},
+    "class_freq_top3": [["cls1",0.00],["cls2",0.00],["cls3",0.00]],
+    "long_tail": "<none|minor|moderate|severe>"
+  },
+  "hardware": {"gpu_mem_gb": 16, "latency_ms_budget": 30},
+  "hyperparams": {
+    "optimizer": "AdamW",
+    "lr": 0.001,
+    "batch_size": 16,
+    "epochs": 100,
+    "weight_decay": 0.01,
+    "scheduler": "cosine",
+    "warmup_epochs": 3,
+    "img_aug": ["Mosaic(0.5)","MixUp(0.1)","RandomHorizontalFlip(0.5)"],
+    "ema": true,
+    "iou_loss": "CIoU",
+    "cls_loss": "BCE",
+    "obj_loss": "BCE",
+    "nms_iou": 0.6,
+    "conf_thres": 0.25
+  },
+  "anchors": {"auto_anchoring": true, "num_anchors_per_level": 3},
+  "results": {
+    "epoch_last": 0,
+    "train_loss_last": 0.00,
+    "val_loss_last": 0.00,
+    "map_50_95_last": 0.000,
+    "map_50_last": 0.000,
+    "per_class_ap_50_95": {},
+    "val_ar_1": 0.00,
+    "val_ar_10": 0.00,
+    "precision": 0.00,
+    "recall": 0.00,
+    "small_obj_recall": 0.00,
+    "error_modes": [],
+    "events": ["no_nan"]
+  },
+  "previous_ablation": [],
+  "constraints": {"throughput_fps_min": 0, "max_params_million": 0, "latency_ms_budget": 0},
+  "notes": "<自由記述: 課題、クラス混同、誤検出タイプなど>"
+}
+</INPUT>
+<OUTPUT_SCHEMA>
+{
+  "diagnosis": "...",
+  "topline_goal": "...",
+  "plan": [
+    {
+      "title": "...",
+      "changes": [{"param":"...", "from": "...", "to":"..."}],
+      "data_ops": ["..."],
+      "expected_effect": "...",
+      "stop_criteria": "...",
+      "priority": 1
+    }
+  ],
+  "ablation_order": ["...","..."],
+  "risk_notes": ["..."],
+  "self_check": {"specificity_0to5": 0, "consistency_0to5": 0, "actionability_0to5": 0}
+}
+</OUTPUT_SCHEMA>
+
+
+
