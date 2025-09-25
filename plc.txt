@@ -1,0 +1,232 @@
+いいね、その発想！
+三菱MELSECのMCプロトコルなら、pymcprotocol を使うとかなりシンプルに書けます。まずは「6桁コードを受信（ワード×3）」→「1桁結果を送信（ワード1 or ビット1）」の最小構成です。
+
+⸻
+
+フォルダ構成（最小）
+
+plc-simple/
+├─ main.py
+└─ config.ini
+
+依存関係
+
+pip install pymcprotocol
+
+
+⸻
+
+設定ファイル例（config.ini）
+
+[connection]
+ip = 192.168.0.10
+port = 5007            ; MCプロトコルTCP(3E)の一般的なデフォルト
+
+[receive]
+device = D100          ; 6桁コードの先頭デバイス
+length_words = 3       ; 6 ASCII文字 = 3ワード
+codec = ascii6         ; ascii6 / bcd6 / int6
+
+[send]
+device = D200          ; 送信先（ワード/ビットの先頭）
+method = word          ; word or bit
+codec = int1           ; int1 / ascii1 / bcd1（method=word時のみ有効）
+
+[behaviour]
+auto_ack_when_valid = true  ; 6桁すべて数字ならACK
+ack_value = 1
+nack_value = 0
+
+[general]
+poll_ms = 200
+log_level = INFO
+
+例：受信は D100-D102 を3ワード読む（ASCII 2文字/ワード）。送信は D200 に1桁を書込（word）または M200 などビットに出す場合は method=bit に変更。
+
+⸻
+
+シンプル実装（main.py）
+
+import configparser
+import logging
+import time
+from pathlib import Path
+from typing import List
+
+from pymcprotocol import Type3E  # MCプロトコル(3Eフレーム/TCP)
+
+# ---------- 文字エンコード（ASCII/BCD/INT） ----------
+def regs_to_ascii(regs: List[int]) -> str:
+    chars = []
+    for r in regs:
+        hi = (r >> 8) & 0xFF
+        lo = r & 0xFF
+        if hi:
+            chars.append(chr(hi))
+        if lo:
+            chars.append(chr(lo))
+    return "".join(chars)
+
+def ascii_to_regs(s: str) -> List[int]:
+    b = s.encode("ascii", errors="ignore")
+    if len(b) % 2 == 1:
+        b += b"\x00"
+    regs = []
+    for i in range(0, len(b), 2):
+        regs.append((b[i] << 8) | b[i + 1])
+    return regs
+
+def regs_to_bcd(regs: List[int], digits: int) -> str:
+    nums = []
+    for r in regs:
+        nums.extend([(r >> 12) & 0xF, (r >> 8) & 0xF, (r >> 4) & 0xF, r & 0xF])
+    return "".join(str(n) for n in nums)[:digits]
+
+def bcd_to_regs(s: str) -> List[int]:
+    ds = [int(c) for c in s]
+    while len(ds) % 4 != 0:
+        ds.append(0)
+    regs = []
+    for i in range(0, len(ds), 4):
+        regs.append((ds[i] << 12) | (ds[i+1] << 8) | (ds[i+2] << 4) | ds[i+3])
+    return regs
+
+def decode_code(regs: List[int], codec: str, digits: int = 6) -> str:
+    if codec == "ascii6":
+        return regs_to_ascii(regs)[:digits].strip()
+    elif codec == "bcd6":
+        return regs_to_bcd(regs, digits)
+    elif codec == "int6":
+        # 実機依存。ここでは単純に結合→ゼロ詰め
+        v = 0
+        for r in regs:
+            v = (v << 16) | r
+        return str(v).zfill(digits)[-digits:]
+    else:
+        raise ValueError(f"unknown codec: {codec}")
+
+def encode_1digit(value: str, codec: str) -> List[int]:
+    v = value.strip() or "0"
+    if codec == "int1":
+        return [int(v)]
+    elif codec == "ascii1":
+        return ascii_to_regs(v[:1])
+    elif codec == "bcd1":
+        return bcd_to_regs(v[:1])
+    else:
+        raise ValueError(f"unknown codec: {codec}")
+
+# ---------- メイン処理 ----------
+def main():
+    # 設定読み込み
+    cfg = configparser.ConfigParser()
+    cfg.read(Path(__file__).with_name("config.ini"))
+
+    log_level = cfg.get("general", "log_level", fallback="INFO").upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.INFO),
+                        format="%(asctime)s %(levelname)s: %(message)s")
+    poll_ms = cfg.getint("general", "poll_ms", fallback=200)
+
+    ip = cfg["connection"]["ip"]
+    port = cfg.getint("connection", "port", fallback=5007)
+
+    rcv_dev = cfg["receive"]["device"]
+    rcv_len = cfg.getint("receive", "length_words", fallback=3)
+    rcv_codec = cfg.get("receive", "codec", fallback="ascii6")
+
+    snd_dev = cfg["send"]["device"]
+    snd_method = cfg.get("send", "method", fallback="word")    # word / bit
+    snd_codec = cfg.get("send", "codec", fallback="int1")      # word出力時のみ
+
+    auto_ack = cfg.getboolean("behaviour", "auto_ack_when_valid", fallback=True)
+    ack_value = cfg.get("behaviour", "ack_value", fallback="1")
+    nack_value = cfg.get("behaviour", "nack_value", fallback="0")
+
+    mc = Type3E()
+    mc.connect(ip, port)
+    logging.info(f"Connected to {ip}:{port}")
+
+    try:
+        while True:
+            # --- 受信：6桁コードを読む（word単位） ---
+            regs = mc.batchread_wordunits(headdevice=rcv_dev, readsize=rcv_len)
+            code6 = decode_code(regs, codec=rcv_codec, digits=6)
+            logging.info(f"Received code: '{code6}' (regs={regs})")
+
+            # --- 判定（例：6桁の数字ならACK） ---
+            is_valid = code6.isdigit() and len(code6) == 6 if auto_ack else False
+            out_str = ack_value if is_valid else nack_value
+
+            # --- 送信：1桁の確認結果 ---
+            if snd_method == "word":
+                regs_out = encode_1digit(out_str, snd_codec)
+                mc.batchwrite_wordunits(headdevice=snd_dev, values=regs_out)
+            elif snd_method == "bit":
+                # 0/1 を1点だけ書く想定。複数点に出すなら list 化。
+                bitval = 1 if out_str != "0" else 0
+                mc.batchwrite_bitunits(headdevice=snd_dev, values=[bitval])
+            else:
+                raise ValueError("send.method must be 'word' or 'bit'")
+
+            logging.info(f"Sent confirm: {out_str} via {snd_method} -> {snd_dev}")
+
+            time.sleep(max(0.05, poll_ms / 1000.0))
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user.")
+    finally:
+        mc.close()
+        logging.info("Disconnected.")
+
+if __name__ == "__main__":
+    main()
+
+
+⸻
+
+ポイント（よりシンプルにする工夫）
+	•	pymcprotocol のみで完結
+	•	読み取りは batchread_wordunits(headdevice, readsize)
+	•	書き込みは batchwrite_wordunits(headdevice, values) / batchwrite_bitunits(headdevice, values)
+	•	デバイス指定は文字列（例："D100", "M200"）。受信・送信ともに 設定ファイルに集約。
+	•	ASCII 2文字/ワードの想定（Hi/Lo）。実機で逆順なら regs_to_ascii/ascii_to_regs のHi/Loを入れ替えるだけ。
+	•	ビット出力に切替したい場合は send.method=bit とし、send.device を Mxxx や Yxxx にするだけ。
+	•	アドレス／デバイスは実機の割付に合わせて変更（D, W, R, ZR 等でもOK）。
+
+⸻
+
+よくあるハマりどころ
+	1.	ポート番号
+　MC/TCPは一般に 5007。ゲートウェイ機器やEthernetユニットの設定で変わることがあります。
+	2.	ネットワーク分離
+　FA-LANとIT-LANのVLAN分離で疎通しないケース。Ping/ポート開放を現場側で確認。
+	3.	ワード順／文字順
+　ASCIIのHi/Lo順序や、ワードの並び順がラダー側で逆になっている場合あり。両側で固定値を書いて相互確認。
+	4.	デバイス種
+　D の代わりに R/W/ZR 等を使う場合、連続領域が確保されているか要確認。
+
+⸻
+
+もっと簡略形（“とりあえず動作確認”ワンファイル）
+
+「設定ファイルも不要で1回だけ読んで1回だけ書く」最小確認なら：
+
+from pymcprotocol import Type3E
+
+mc = Type3E()
+mc.connect("192.168.0.10", 5007)
+
+# 6桁コード（D100-D102）
+regs = mc.batchread_wordunits("D100", 3)
+code = "".join(chr((r>>8)&0xFF) + chr(r&0xFF) for r in regs).strip()[:6]
+print("code =", code)
+
+# 結果送信（D200に数値1）
+mc.batchwrite_wordunits("D200", [1])
+
+mc.close()
+
+
+⸻
+
+必要なら、ビット/ラッチのハンドシェイク（受信完了ビットを返す→PLC側でリセットなど）も数行足すだけでOKです。
+実機の「デバイス（D/M/Y/Rなど）」「6桁コードの格納方式（ASCII/BCD）」「ハンドシェイク有無」が分かれば、そこにピッタリ合わせた設定例とコードを出しますよ。
