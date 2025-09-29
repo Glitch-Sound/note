@@ -1,0 +1,79 @@
+結論：OpenLayers単体に「今この瞬間に左ボタンが押されているか」を直接問い合わせるAPIはありません。
+任意タイミングで知りたい場合は、Pointer イベントで状態を記録しておき、必要時にそのフラグを読むのが実用解です。
+
+下は Vue 3 / TypeScript でもそのまま使える最小実装（OpenLayersの map.getViewport() にだけバインド）。
+ウィンドウ外で離されたケースなどもケアしています。
+
+// mouseState.ts
+import type Map from 'ol/Map';
+
+export function useMouseStateOnMap(map: Map) {
+  // 左ボタン押下中か
+  let leftDown = false;
+
+  // cleanup 用にリスナを保持
+  const disposers: Array<() => void> = [];
+
+  // buttons のビット: 1=左, 2=右, 4=中
+  const isLeft = (buttonsOrButton: number) => (buttonsOrButton & 1) === 1;
+
+  const vp = map.getViewport();
+
+  // pointerdown/up/cancel は viewport に
+  const onPointerDown = (e: PointerEvent) => {
+    if (isLeft(e.buttons || (1 << e.button))) leftDown = true;
+    // 連続ドラッグ中にウィンドウ外へ出ても追えるように capture
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+  };
+  const onPointerUp = (e: PointerEvent) => {
+    if (e.button === 0 || !isLeft(e.buttons)) leftDown = false;
+    (e.target as Element).releasePointerCapture?.(e.pointerId);
+  };
+  const onPointerCancel = () => { leftDown = false; };
+
+  vp.addEventListener('pointerdown', onPointerDown);
+  vp.addEventListener('pointerup', onPointerUp);
+  vp.addEventListener('pointercancel', onPointerCancel);
+
+  // ウィンドウ外で離された場合の保険
+  const onWindowUp = (e: PointerEvent) => {
+    if (e.button === 0) leftDown = false;
+  };
+  const onBlur = () => { leftDown = false; };
+  window.addEventListener('pointerup', onWindowUp);
+  window.addEventListener('blur', onBlur);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') leftDown = false;
+  });
+
+  disposers.push(
+    () => vp.removeEventListener('pointerdown', onPointerDown),
+    () => vp.removeEventListener('pointerup', onPointerUp),
+    () => vp.removeEventListener('pointercancel', onPointerCancel),
+    () => window.removeEventListener('pointerup', onWindowUp),
+    () => window.removeEventListener('blur', onBlur),
+  );
+
+  return {
+    /** 任意タイミングで呼ぶ：左ボタン押下中なら true */
+    isLeftDown: () => leftDown,
+    /** 片付け */
+    dispose: () => { disposers.forEach(fn => fn()); }
+  };
+}
+
+使い方（例）
+
+const ms = useMouseStateOnMap(map);
+
+// どこかのタイマーや処理の途中で
+if (ms.isLeftDown()) {
+  // 左押しっぱなし中の処理
+}
+
+補足
+	•	OpenLayersの ol/events/condition.primaryAction(evt) はイベント内で「左ボタンか」を判定するためのもので、任意タイミング照会には使えません。
+	•	MouseEvent.buttons（ビットマスク）で左=1。押下中の継続判定はこの値を受けた瞬間に自前で保持する必要があります。
+	•	タッチ対応が必要なら、pointerType === 'touch' の扱いを分ける（長押し≒左押下扱いにする など）ポリシーを足してください。
+
+必要なら、Piniaに状態を置く版や、地図外でも共通で使えるグローバル版（window にだけ付ける）も用意します。どう使う予定か教えてくれれば、用途に最適化したコードにしますよ。
