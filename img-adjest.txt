@@ -1,0 +1,191 @@
+とある画像があり、位置合わせを行いたい。
+強度ベース、特徴点ベースなど様々な手法があるのは承知しているが、画像サイズが大きいため、なるべくシンプルな手法にしたい。
+
+画像自体は添付のように直線が多いシンプルな形状となっており内部は布となっている。
+
+どの画像にも①のような水平方向に横断する線があるため、この線を検知することで、
+
+　1. 傾きを水平にして
+　2. X軸方向の位置合わせを行い
+　3. Y軸方向の位置合わせ
+
+を行いないか。
+なお、①の線は説明のため赤色にしているが、実際は黒に近い色となり、縦方向にも似たような線がある。
+長さは①の横方向の線が最も長いため、これを基準にするのがよいと考えている。
+
+
+
+---
+
+いいね、その①の横線を“基準線”にしてスキュー補正→XY位置合わせ、で十分いけます。
+重い手法を使わず、**Canny + Hough（確率的）**だけで回す素朴で速いパイプラインを出します。画像が大きい前提なので、検出は縮小画像で、補正は元解像度で行います。
+
+⸻
+
+方針（シンプル＆堅牢）
+
+0) 前処理（軽く）
+	•	グレースケール → 軽いGaussianBlur(3〜5px)。
+	•	縮小（長辺を 1200〜1600px 目安）して検出専用画像を作る。
+	•	端子布のテクスチャを抑えたいときは**opening（3×3）**を一回。
+
+1) 傾き補正（回転）
+	1.	縮小画像に Canny。
+	2.	HoughLinesPで「ほぼ水平」の直線だけ残す：
+|角度| ≤ 5°、minLineLength ≥ 0.8 * 画像幅（＝“最長の横線しか通さない”）。
+	3.	得られた候補の長さ最大（または上位数本の角度の中央値）を採用。
+	4.	角度 θ を元画像に適用して回転補正（warpAffine、境界は replicate）。
+
+これで 1. の“傾きを水平に”を達成。
+角度検出は縮小でOK、回転はフル解像度で実行。
+
+2) Y 方向位置合わせ（基準線の縦位置）
+	1.	回転後の画像にもう一度 Canny→Hough（今度は±2°などさらに水平限定）。
+	2.	最長の水平線を“基準線”と確定。
+	3.	その線のy 座標（端点の平均 y）を取り、目標の基準 y* との差を dy として平行移動。
+
+これで 3. の“Y 方向の位置合わせ”を達成。
+（「常に画像中央から 380px に基準線が来る」等、任意の y* をテンプレ化）
+
+3) X 方向位置合わせ（交点で一意に）
+
+水平線だけだと x 平行移動が一意に決まりません。
+依存先を最小に抑えつつ、次のいずれかをおすすめ：
+
+A. 交差する“最長の縦線”を使う（推奨）
+	•	回転＋Y合わせ後、基準線の±h（例: ±20px）帯だけを ROI に。
+	•	ROI で Hough（今度はほぼ垂直：|角度−90°| ≤ 5°、minLineLength ≥ 0.6 * 画像高）。
+	•	基準線と交差する縦線のうち最長（or 中央付近）を“アンカー縦線”とする。
+	•	交点の x を取り、目標 x* との差を dx として平行移動。
+
+B. 1D 正規化相互相関（NCC）で横ズレだけ推定（線の質が不均一な場合）
+	•	回転＋Y合わせ後、**基準線を中心にした細帯 ROI（高さ ~20px）**を切り出し。
+	•	テンプレート（基準画像の同じ帯）と横方向 1D NCC → 最大値位置が dx。
+	•	帯だけなので計算が非常に軽い。照明ムラに強い。
+
+これで 2. の“X 方向の位置合わせ”を達成。
+
+⸻
+
+パラメータの目安
+	•	Canny: low=50, high=150（コントラスト次第で調整）
+	•	HoughLinesP（水平検出時）
+	•	rho=1, theta=1°(π/180), threshold=80〜120
+	•	minLineLength = 0.8*幅、maxLineGap = 10〜20
+	•	HoughLinesP（垂直検出時）
+	•	minLineLength = 0.6*高さ、角度窓は 90°±5°
+	•	角度ロバスト化：上位3〜5本の角度の中央値を採用
+	•	ROI 幅：基準線±20〜40px 程度（画像解像度に比例）
+
+⸻
+
+画質／色の注意
+	•	①の線が黒〜濃グレーで一定太さなら、2値化よりエッジ検出の方が安定。
+	•	ラインが途切れ気味なら **closing（5×1 or 7×1）**で横方向だけ繋ぐと Hough が通りやすい。
+	•	縦線は帯 ROI 内だけ探すことで誤検出（外枠・布模様）を抑制。
+
+⸻
+
+失敗しやすいケースと対策
+	•	最長の横線がフレーム外で短く見える：minLineLength を 0.6W まで下げ、角度窓を狭める（±3°）。
+	•	縦線が弱い／複数ある：交差スコア＝「縦線長 × 交差角の水平直交性 × 交点の信頼度（ROI 内）」でランキング。
+	•	どうしても縦線が取れない：方法B（1D NCC）へ自動フォールバック。
+
+⸻
+
+参考コード（OpenCV / Python・最小構成）
+
+import cv2 as cv
+import numpy as np
+from math import atan2, degrees
+
+def detect_main_horizontal_line(img_small):
+    edges = cv.Canny(img_small, 50, 150)
+    lines = cv.HoughLinesP(edges, 1, np.pi/180, threshold=100,
+                           minLineLength=int(0.8*img_small.shape[1]), maxLineGap=20)
+    if lines is None: return None, 0.0
+    cand = []
+    for x1,y1,x2,y2 in lines[:,0]:
+        ang = degrees(atan2((y2-y1), (x2-x1)))
+        if abs(ang) <= 5:  # 水平
+            length = np.hypot(x2-x1, y2-y1)
+            cand.append(((x1,y1,x2,y2), ang, length))
+    if not cand: return None, 0.0
+    best = max(cand, key=lambda t:t[2])
+    # 角度の中央値でロバスト化してもOK
+    return best[0], best[1]
+
+def deskew(img):
+    # 検出は縮小で
+    scale = 1600 / max(img.shape[:2])
+    small = cv.resize(img, None, fx=scale, fy=scale, interpolation=cv.INTER_AREA)
+    line, ang = detect_main_horizontal_line(small)
+    if line is None: return img, 0.0
+    h, w = img.shape[:2]
+    M = cv.getRotationMatrix2D((w/2, h/2), ang, 1.0)
+    return cv.warpAffine(img, M, (w, h), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE), ang
+
+def find_baseline_y(img_rot):
+    edges = cv.Canny(img_rot, 50, 150)
+    lines = cv.HoughLinesP(edges, 1, np.pi/180, threshold=120,
+                           minLineLength=int(0.8*img_rot.shape[1]), maxLineGap=15)
+    ys = []
+    if lines is not None:
+        for x1,y1,x2,y2 in lines[:,0]:
+            ang = degrees(atan2((y2-y1), (x2-x1)))
+            if abs(ang) <= 2:
+                ys.append((y1+y2)/2)
+    if not ys: return None
+    return int(np.median(ys))
+
+def align_by_xy(img_rot, y_target):
+    y0 = find_baseline_y(img_rot)
+    if y0 is None: return img_rot, (0,0), None
+    dy = int(y_target - y0)
+
+    # 基準線±20pxの帯で縦線を探す
+    band = 20
+    y1, y2 = max(y0-band,0), min(y0+band, img_rot.shape[0]-1)
+    roi = img_rot[y1:y2, :]
+    edges = cv.Canny(roi, 50, 150)
+    lines = cv.HoughLinesP(edges, 1, np.pi/180, threshold=60,
+                           minLineLength=int(0.6*img_rot.shape[0]), maxLineGap=10)
+    x_anchor = None
+    if lines is not None:
+        best = None
+        for x1,y1_,x2,y2_ in lines[:,0]:
+            ang = abs(degrees(atan2((y2_-y1_), (x2-x1))))
+            if abs(ang-90) <= 5:
+                L = np.hypot(x2-x1, y2_-y1_)
+                if best is None or L > best[0]:
+                    best = (L, x1)  # ほぼ垂直なので x1≈x2
+        if best is not None:
+            x_anchor = best[1]
+
+    # 縦線が取れなければ x は 0 とする（必要なら 1D NCC へフォールバック）
+    dx = 0 if x_anchor is None else int( /* 任意の固定 x* */ 200 - x_anchor )
+
+    M = np.float32([[1,0,dx],[0,1,dy]])
+    aligned = cv.warpAffine(img_rot, M, (img_rot.shape[1], img_rot.shape[0]),
+                            flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
+    return aligned, (dx,dy), x_anchor
+
+実運用では
+	•	y_target と x* は「社内基準画像」で一度測って固定。
+	•	もし x_anchor が取れないフレームがあれば、1D NCCで dx を出すフォールバックを追加。
+
+⸻
+
+まとめ
+	•	最長の水平線で回転＆Y位置を決める。
+	•	交差する最長の垂直線（または1D NCC）で X を決める。
+	•	すべて Canny + Hough + 平行移動で完結。
+	•	検出は縮小、補正はフル解像度、帯 ROI を使って高速かつロバスト。
+
+必要なら、あなたの実画像の1枚でこの手順に合わせてパラメータを私の方で当て込み版も作れます。
+
+
+
+
+
+
