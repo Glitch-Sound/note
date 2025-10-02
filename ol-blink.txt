@@ -1,0 +1,202 @@
+了解！いちばん扱いやすくて堅牢なのは、「ハイライト専用の Vector レイヤーを重ねる方式」です。
+MVT（VectorTile）は線がタイルで分割されるので、対象ラインを別レイヤーに 1 本だけ描けば、点滅・発光・破線アニメなどを軽く安全に実装できます。
+
+下は Angular + OpenLayers の最小構成（コピーして動く構成）。
+	•	MVT を描く通常レイヤー
+	•	ハイライト専用の Vector レイヤー
+	•	requestAnimationFrame で不透明度と破線オフセットを回し、**点滅＋流れる破線（発光風）**にします。
+	•	クリックで MVT の線形を拾って「そのタイル分だけ」光らせる例と、ID から GeoJSON を取得して全体を光らせる例の両方を用意しています（実運用は後者がおすすめ）。
+
+⸻
+
+map.component.html
+
+<div class="map" #mapEl></div>
+
+map.component.scss
+
+.map { width: 100%; height: 100vh; }
+
+map.component.ts
+
+import {
+  AfterViewInit, Component, ElementRef, OnDestroy, ViewChild,
+} from '@angular/core';
+
+import Map from 'ol/Map';
+import View from 'ol/View';
+import {fromLonLat} from 'ol/proj';
+import VectorTileLayer from 'ol/layer/VectorTile';
+import VectorTileSource from 'ol/source/VectorTile';
+import MVT from 'ol/format/MVT';
+import VectorLayer from 'ol/layer/Vector';
+import VectorSource from 'ol/source/Vector';
+import GeoJSON from 'ol/format/GeoJSON';
+import {Style, Stroke} from 'ol/style';
+import {Geometry} from 'ol/geom';
+
+@Component({
+  selector: 'app-map',
+  templateUrl: './map.component.html',
+  styleUrls: ['./map.component.scss'],
+})
+export class MapComponent implements AfterViewInit, OnDestroy {
+  @ViewChild('mapEl', { static: true }) mapEl!: ElementRef<HTMLDivElement>;
+
+  private map!: Map;
+
+  /** --- 通常の MVT レイヤー --- */
+  private vtLayer = new VectorTileLayer({
+    source: new VectorTileSource({
+      format: new MVT(),
+      url: 'https://your.tileserver.example/tiles/{z}/{x}/{y}.mvt',
+      // 必要に応じて maxZoom, minZoom, tilePixelRatio などを設定
+    }),
+    renderMode: 'hybrid', // ヒット検出が扱いやすい
+    declutter: false,
+    style: new Style({
+      stroke: new Stroke({ width: 2, color: '#2c7fb8' }),
+    }),
+  });
+
+  /** --- ハイライト専用レイヤー（1本だけ載せる） --- */
+  private highlightSource = new VectorSource();
+  private highlightLayer = new VectorLayer({
+    source: this.highlightSource,
+    style: (feature, res) => this.highlightStyle(),
+    updateWhileAnimating: true,
+    updateWhileInteracting: true,
+    zIndex: 9999, // 最前面
+  });
+
+  /** アニメ用パラメータ */
+  private animId: number | null = null;
+  private t = 0;                 // 時間
+  private dashOffset = 0;        // 破線オフセット
+  private pulseAlpha = 1;        // 発光の強さ（0-1）
+
+  ngAfterViewInit(): void {
+    this.map = new Map({
+      target: this.mapEl.nativeElement,
+      layers: [this.vtLayer, this.highlightLayer],
+      view: new View({
+        center: fromLonLat([139.767, 35.681]), // 東京駅あたり
+        zoom: 14,
+      }),
+    });
+
+    // --- デモ: クリックしたラインの「そのタイル分」をハイライト ---
+    this.map.on('singleclick', (evt) => {
+      this.map.forEachFeatureAtPixel(evt.pixel, (feat, layer) => {
+        if (layer === this.vtLayer) {
+          const geom = (feat.getGeometry() as Geometry)?.clone();
+          if (geom) {
+            this.setHighlightGeometry(geom);
+          }
+        }
+      }, { hitTolerance: 5 });
+    });
+
+    // アニメ開始（常に回しておき、描くのは highlight がある時だけ）
+    this.startAnimation();
+  }
+
+  ngOnDestroy(): void {
+    if (this.animId !== null) cancelAnimationFrame(this.animId);
+  }
+
+  /** ========== 公開 API：ID 指定でハイライト（推奨） ========== */
+  async highlightById(roadId: string) {
+    // 例: API から GeoJSON（対象ライン全体）を取得して光らせる
+    // サーバ側で "id = roadId" の一筆を返すようにしておく
+    const res = await fetch(`/api/roads/${roadId}.geojson`);
+    const gj = await res.json();
+
+    const feats = new GeoJSON().readFeatures(gj, {
+      dataProjection: 'EPSG:4326',
+      featureProjection: 'EPSG:3857', // 地図ビューに合わせる
+    });
+
+    this.highlightSource.clear();
+    this.highlightSource.addFeatures(feats);
+    // 初期値リセット（すぐ点滅が見えるように）
+    this.t = 0;
+    this.dashOffset = 0;
+    this.pulseAlpha = 1;
+    this.highlightLayer.changed();
+  }
+
+  /** ========== 内部: Geometry を直接渡してハイライト（クリック用） ========== */
+  private setHighlightGeometry(geom: Geometry) {
+    this.highlightSource.clear();
+    this.highlightSource.addFeature(new (geom as any).constructor(geom.getCoordinates()));
+    this.t = 0;
+    this.dashOffset = 0;
+    this.pulseAlpha = 1;
+    this.highlightLayer.changed();
+  }
+
+  /** 点滅＋流れる破線のスタイル（外側グロー＋内側本線の二重描画） */
+  private highlightStyle(): Style[] {
+    // 0.4〜1.0 でゆっくり点滅
+    const alpha = 0.4 + 0.6 * this.pulseAlpha;
+
+    // 外側グロー（太く・半透明白）
+    const outer = new Style({
+      stroke: new Stroke({
+        color: `rgba(255,255,255,${alpha * 0.9})`,
+        width: 12,
+        lineCap: 'round',
+        lineJoin: 'round',
+      }),
+    });
+
+    // 内側の本線（色固定・破線を流す）
+    const inner = new Style({
+      stroke: new Stroke({
+        color: `rgba(255,0,0,${alpha})`,
+        width: 5,
+        lineCap: 'round',
+        lineJoin: 'round',
+        lineDash: [12, 10],        // 破線パターン
+        lineDashOffset: this.dashOffset, // オフセットで流れる表現
+      }),
+    });
+
+    return [outer, inner];
+  }
+
+  /** rAF でアニメーション（点滅＋破線オフセット） */
+  private startAnimation() {
+    const tick = () => {
+      this.t += 1 / 60; // 秒想定
+      // ゆっくり点滅
+      this.pulseAlpha = 0.5 * (1 + Math.sin(this.t * 2.2));
+      // 破線を左→右に流す
+      this.dashOffset = (this.dashOffset + 1.5) % 100;
+
+      // ハイライト要素がある時だけ再描画
+      if (this.highlightSource.getFeatures().length > 0) {
+        this.highlightLayer.changed();
+      }
+      this.animId = requestAnimationFrame(tick);
+    };
+    this.animId = requestAnimationFrame(tick);
+  }
+}
+
+
+⸻
+
+使い分けの要点
+	•	本番運用：highlightById(id) のように ID から GeoJSON を1本だけ取得して highlightSource に入れるのがベスト。
+	•	タイル分割の影響を受けず、軽量・確実。
+	•	簡易操作（クリックで強調）：上記の singleclick ハンドラで、クリックしたタイルに含まれる線の分だけ複製してハイライト（分割線なので連続全長にならないことがある点に注意）。
+
+カスタムのヒント
+	•	点滅だけで良い → lineDash を外し、alpha だけを変化。
+	•	常時発光 → pulseAlpha を固定（例：1.0）、outer.width を大きめに。
+	•	太さアニメ → width を Math.sin() で周期変化させてもOK。
+	•	パフォーマンス → 対象1本のみ描く／updateWhileAnimating: true を付ける／highlightLayer だけ changed()。
+
+必要なら、あなたの MVT の属性（ID 名）やタイル URL に合わせて highlightById 用の API 仕様と最短バックエンド実装例（FastAPI/Node）も出します。
