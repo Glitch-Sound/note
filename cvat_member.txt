@@ -1,0 +1,75 @@
+はい、**CVAT（Computer Vision Annotation Tool）では、複数ユーザが登録されている場合に、特定のプロジェクトを操作できるユーザを指定することが可能です。CVATはロールベースアクセス制御（RBAC: Role-Based Access Control）**を備えており、これを通じてプロジェクトやタスク単位でのアクセス制御が行えます。
+
+⸻
+
+🔧 実現方法の概要
+
+CVATのWeb UIまたはAPIを利用して、次のように設定できます。
+
+1. プロジェクト作成時に権限を設定
+
+プロジェクト作成時に「オーナー（Owner）」「マネージャ（Manager）」「アノテーター（Annotator）」「レビュアー（Reviewer）」といったロールを設定できます。
+	•	Owner：プロジェクトの完全な管理権限（削除・編集・ユーザ追加が可能）
+	•	Manager：タスクの割り当てや管理が可能
+	•	Annotator：アノテーション作業のみ可能
+	•	Reviewer：レビュアー権限（結果の確認・修正）
+
+2. 既存プロジェクトへのユーザ追加
+
+プロジェクト作成後でも、対象ユーザをプロジェクトメンバーとして追加できます。
+	•	手順（Web UIの場合）
+	1.	CVATに管理者またはプロジェクトオーナーとしてログイン
+	2.	該当プロジェクトを開く
+	3.	「Settings」や「Members」タブに移動
+	4.	「Add Member」ボタンでユーザを選択し、ロールを指定
+
+3. API経由で設定
+
+CVAT REST APIを使って、スクリプトから自動的にアクセス権限を設定することも可能です。
+
+例：
+
+curl -X POST "http://<CVAT_URL>/api/projects/<project_id>/memberships" \
+     -H "Authorization: Token <your_admin_token>" \
+     -H "Content-Type: application/json" \
+     -d '{"user": <user_id>, "role": "annotator"}'
+
+
+⸻
+
+👥 ロール設定の活用例
+
+ユーザ名	権限	操作可能範囲
+admin	owner	全操作可能
+user_a	annotator	アノテーションのみ
+user_b	reviewer	チェックのみ
+user_c	manager	タスクの割り当てや進捗管理
+
+
+⸻
+
+⚠️ 注意点
+	•	ユーザ追加・削除はOwnerまたはAdminのみ可能です。
+	•	CVATをDockerで構築している場合、初期管理者は環境変数CVAT_ADMIN_USERNAMEなどで指定されています。
+	•	LDAPやOAuth2など外部認証連携をしている場合でも、CVAT内の権限設定は独立して行う必要があります。
+
+⸻
+
+✅ まとめ
+
+要素	内容
+実現可否	✅ 可能
+設定方法	Web UIまたはREST APIで設定
+単位	プロジェクト単位（Task単位でも可能）
+権限制御	Owner / Manager / Annotator / Reviewer
+
+
+⸻
+
+もし「一部のユーザだけが特定のプロジェクトを操作できる」ように自動化（例：Pythonスクリプトで割り当て）したい場合、API経由での設定例も出せます。
+そのような例も見たいですか？
+
+
+
+
+
