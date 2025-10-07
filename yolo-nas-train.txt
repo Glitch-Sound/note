@@ -1,0 +1,154 @@
+了解！最小限で「学習 → 推論」まで動く YOLO-NAS（SuperGradients版） のサンプルを2本出します。
+※YOLO-NASの“学習”は SuperGradients パッケージで行います（UltralyticsのNASは推論専用で学習は不可）。 ￼
+
+⸻
+
+0) 事前準備（インストール）
+
+pip install --upgrade super-gradients torch torchvision
+
+データは YOLO形式（images/{train,val} と labels/{train,val}、ラベルはclass x_center y_center w hのtxt）を用意してください。読み込み関数は下のコード内で使う coco_detection_yolo_format_* です。 ￼
+
+⸻
+
+1) 学習用：train_yolonas_min.py
+
+# train_yolonas_min.py
+# 最小限のYOLO-NAS学習スクリプト（YOLOフォーマットの自前データでOK）
+from super_gradients.training import Trainer, models
+from super_gradients.training.dataloaders.dataloaders import (
+    coco_detection_yolo_format_train, coco_detection_yolo_format_val
+)
+from super_gradients.training.losses import PPYoloELoss
+from super_gradients.training.metrics import DetectionMetrics_050
+from super_gradients.training.models.detection_models.pp_yolo_e import PPYoloEPostPredictionCallback
+
+# --- 必要に応じて書き換え ---
+CLASSES   = ["class0", "class1"]     # クラス名（学習データの順番と一致させる）
+DATA_DIR  = "/path/to/dataset_root"  # この直下に images/ と labels/ がある想定
+BATCH     = 8
+EPOCHS    = 5
+EXP_NAME  = "yolonas_min"
+CKPT_DIR  = "./checkpoints"
+# --------------------------------
+
+# DataLoader（YOLOフォーマット）
+train_loader = coco_detection_yolo_format_train(
+    dataset_params=dict(
+        data_dir=DATA_DIR,
+        images_dir="images/train",
+        labels_dir="labels/train",
+        classes=CLASSES,
+    ),
+    dataloader_params=dict(batch_size=BATCH, num_workers=2),
+)
+val_loader = coco_detection_yolo_format_val(
+    dataset_params=dict(
+        data_dir=DATA_DIR,
+        images_dir="images/val",
+        labels_dir="labels/val",
+        classes=CLASSES,
+    ),
+    dataloader_params=dict(batch_size=BATCH, num_workers=2),
+)
+
+# モデル（S/M/L が選べる：yolo_nas_s / _m / _l）
+model = models.get(
+    "yolo_nas_s",
+    num_classes=len(CLASSES),
+    pretrained_weights="coco",  # 事前学習重みから微調整
+)
+
+# Trainer
+trainer = Trainer(experiment_name=EXP_NAME, ckpt_root_dir=CKPT_DIR)
+
+# 最小限の学習パラメータ
+train_params = dict(
+    max_epochs=EPOCHS,
+    optimizer="AdamW",
+    initial_lr=5e-4,
+    average_best_models=True,
+    mixed_precision=False,  # AMP使うなら True に
+    loss=PPYoloELoss(use_static_assigner=False),
+    train_metrics_list=[
+        DetectionMetrics_050(
+            num_cls=len(CLASSES),
+            post_prediction_callback=PPYoloEPostPredictionCallback(
+                conf=0.25, iou=0.65, max_predictions=300
+            ),
+        )
+    ],
+    valid_metrics_list=[
+        DetectionMetrics_050(
+            num_cls=len(CLASSES),
+            post_prediction_callback=PPYoloEPostPredictionCallback(
+                conf=0.25, iou=0.65, max_predictions=300
+            ),
+        )
+    ],
+)
+
+# 学習スタート
+trainer.train(
+    model=model,
+    training_params=train_params,
+    train_loader=train_loader,
+    valid_loader=val_loader,
+)
+# ベスト重み:  ./checkpoints/{EXP_NAME}/ckpt_best.pth に保存
+
+上のAPI名（coco_detection_yolo_format_train/val、models.get("yolo_nas_s", ...) など）はSuperGradientsの標準的な最小例に沿っています。 ￼
+
+⸻
+
+2) 推論用：infer_yolonas_min.py
+
+# infer_yolonas_min.py
+# １枚/動画/フォルダに対して簡単に推論＆保存
+from super_gradients.training import models
+
+# --- 必要に応じて書き換え ---
+SRC = "path/to/image_or_video_or_folder"    # 入力
+OUT = "pred_out"                             # 出力ディレクトリ
+# Option A: COCO事前学習モデルで試す
+# model = models.get("yolo_nas_s", pretrained_weights="coco")
+
+# Option B: 学習済みチェックポイントで推論（クラス数の指定を忘れずに）
+model = models.get(
+    "yolo_nas_s",
+    num_classes=2,  # あなたのクラス数に合わせる
+    checkpoint_path="./checkpoints/yolonas_min/ckpt_best.pth",
+)
+
+# conf=0.25 などの閾値は適宜調整可
+preds = model.predict(SRC, conf=0.25)
+
+# 画付きで確認（ノートブックなら表示、スクリプトなら不要）
+# preds.show()
+
+# 結果を保存（画像/動画は自動でアノテーション付きを出力）
+preds.save(OUT)
+
+# --- ボックスやスコアをコードから使いたいとき ---
+# for p in preds:
+#     boxes_xyxy = p.prediction.bboxes_xyxy  # [N,4] (x1,y1,x2,y2)
+#     scores     = p.prediction.confidence   # [N]
+#     labels     = p.prediction.labels       # [N] (クラスID)
+#     print(boxes_xyxy, scores, labels)
+
+model.predict(...) は画像/動画/URL/フォルダに対して手早く結果を得るための簡易APIです（大量推論や本番ではONNX/TensorRTへのエクスポートが推奨）。 ￼
+
+⸻
+
+補足（必要なら）
+	•	ONNX/TensorRT エクスポート：SuperGradientsのモデルは model.export("xxx.onnx", ...) でONNX化できます（本番推論はONNX/TensorRTの方が高速になりやすい）。 ￼
+	•	UltralyticsのNASとの違い：Ultralyticsパッケージ側のNASモデルは 学習不可で推論・検証・エクスポート専用。学習はこの回答の通り SuperGradients を使うのが定石です。 ￼
+
+⸻
+
+必要なら、あなたのデータ構成（クラス名やディレクトリ）に合わせて上の2ファイルをこちらで即時調整します。
+
+
+
+
+
