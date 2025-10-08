@@ -88,3 +88,112 @@ print(f"elapsed={elapsed:.1f}s, throughput={throughput:.1f} MB/s")
 
 
 
+
+===
+
+
+はい、その理解で概ね合っています。
+FastAPI 側でポーリング方式を実現するには、
+BackgroundTasks を使って「処理をバックグラウンドで実行」し、
+フロント(Vue)側では定期的に /status/{job_id} のようなエンドポイントを呼ぶ構成にします。
+
+⸻
+
+✅ 手順まとめ
+
+1️⃣ FastAPI 側
+
+POST /move に BackgroundTasks を追加し、即レスポンスを返します。
+その中で非同期にコピー処理を走らせ、進捗や状態をメモリ（または Redis）に保存します。
+
+# app.py
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+from uuid import uuid4
+import time
+
+app = FastAPI()
+
+# 状態を格納する簡易辞書（本番は Redis 推奨）
+JOB_STATUS = {}
+
+class MoveRequest(BaseModel):
+    bucket: str
+    pairs: list[tuple[str, str]]  # (src, dst)
+
+def do_copy(job_id: str, bucket: str, pairs: list[tuple[str, str]]):
+    JOB_STATUS[job_id] = {"status": "running", "progress": 0}
+    total = len(pairs)
+    for i, (src, dst) in enumerate(pairs, 1):
+        time.sleep(0.3)  # ダミーコピー処理（ここを MinIO/Boto3 に置換）
+        JOB_STATUS[job_id]["progress"] = int(i / total * 100)
+    JOB_STATUS[job_id]["status"] = "done"
+
+@app.post("/move")
+def move(req: MoveRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid4())
+    JOB_STATUS[job_id] = {"status": "queued", "progress": 0}
+    background_tasks.add_task(do_copy, job_id, req.bucket, req.pairs)
+    return {"job_id": job_id}
+
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    return JOB_STATUS.get(job_id, {"status": "not_found"})
+
+
+⸻
+
+2️⃣ Vue 側（ポーリング）
+
+fetch を使って数秒ごとに /status/{job_id} を呼び出し、
+progress を表示します。
+
+// composables/useMove.ts
+import { ref } from "vue";
+
+export function useMove() {
+  const progress = ref(0);
+  const status = ref("");
+
+  async function startMove(bucket: string, pairs: [string, string][]) {
+    const res = await fetch("/api/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bucket, pairs }),
+    });
+    const { job_id } = await res.json();
+
+    // 定期的にポーリング
+    const timer = setInterval(async () => {
+      const s = await fetch(`/api/status/${job_id}`).then(r => r.json());
+      progress.value = s.progress ?? 0;
+      status.value = s.status;
+      if (["done", "error", "not_found"].includes(s.status)) {
+        clearInterval(timer);
+      }
+    }, 2000);
+  }
+
+  return { progress, status, startMove };
+}
+
+
+⸻
+
+💡補足
+	•	BackgroundTasks は「同一プロセス内の別スレッドで処理」を行います。
+→ Uvicorn のワーカーが複数の場合や長時間処理なら Celery / RQ / Dramatiq + Redis を検討。
+	•	タイムアウト回避：フロントは常に軽い API を呼ぶだけなので、
+Nginx やブラウザ側の HTTP タイムアウト制限に引っかかりません。
+	•	再起動耐性を持たせるなら、JOB_STATUS を Redis に置き換えるのが定番です。
+
+⸻
+
+必要であればこの構成を
+	•	Redis 永続化対応版
+	•	MinIO/Boto3 実コピー対応版
+に拡張した完全実装も示せます。
+どちらを先に進めますか？
+
+
+
