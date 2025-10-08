@@ -1,0 +1,61 @@
+了解。ラスタ化なしで、ライブラリに任せて中心線を作る最小サンプルです。
+ここでは centerline（Polygon からストレートスケルトン系のセンターラインを生成）＋ shapely だけを使います。
+
+事前準備
+
+pip install shapely centerline
+
+# 最小コード: ベクタ(Shapely Polygon)→中心線→指定位置から距離dの点
+from shapely.geometry import Polygon, LineString, Point, MultiLineString
+from shapely.ops import linemerge, unary_union
+from shapely.ops import nearest_points
+from centerline.geometry import Centerline
+
+def polygon_centerline(poly: Polygon) -> LineString:
+    """
+    Polygon → 中心線(概形) を返す。中心線が複数本でも最長のLineStringを返す。
+    """
+    # centerline は MultiLineString を返すことが多い
+    cl_obj = Centerline(poly)                     # オプションは基本不要。必要なら segmentize_maxlen 等を追加
+    geom = getattr(cl_obj, "geometry", cl_obj)    # centerline.geometry があれば使う
+
+    # 1本化して最長経路を採用
+    merged = linemerge(unary_union(geom))
+    if isinstance(merged, MultiLineString):
+        return max(merged.geoms, key=lambda g: g.length)
+    return merged
+
+def point_from(start: Point, centerline: LineString, d: float) -> Point:
+    """
+    中心線上で、start を直交射影した位置から弧長 d だけ進んだ点（端でクランプ）。
+    d<0 で後退、d>0 で前進。
+    """
+    _, foot = nearest_points(centerline, start)           # 射影点
+    s0 = centerline.project(foot)                         # 射影点の弧長
+    s = max(0.0, min(centerline.length, s0 + d))          # 端でクランプ
+    return centerline.interpolate(s)
+
+# --- 使い方例 ---
+if __name__ == "__main__":
+    # 適当な曲がった回廊っぽいポリゴン（折れ線をバッファ）
+    base = LineString([(0, 0), (5, 2), (10, 2), (15, 5)])
+    corridor = base.buffer(1.2, cap_style=2, join_style=2)   # Geometry型の Polygon を想定
+
+    cl = polygon_centerline(corridor)                        # 中心線（概形）
+    print("centerline length =", round(cl.length, 3))
+
+    # 指定位置と距離
+    start_pos = Point(0.0, 0.0)   # 任意の“起点となる位置”
+    d = 8.0                       # 進む距離（測地長）
+
+    p = point_from(start_pos, cl, d)
+    print("point =", (round(p.x, 3), round(p.y, 3)))
+
+メモ
+	•	centerline は ストレートスケルトン系の中心線を返します。厳密なメディアルアクシスではありませんが、「なるべくシンプル・高速・だいたいで良い」要件に十分です。
+	•	入口側からの主幹を強めたい場合や線が複数出る場合でも、上の実装は最長の LineStringを自動選択します（必要なら選択ルールを差し替えてください）。
+	•	結果がギザつく場合は、centerline の segmentize_maxlen を小さめにする、または centerline.simplify(tolerance) を軽くかけると安定します。
+
+
+
+
