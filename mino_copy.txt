@@ -1,0 +1,90 @@
+ざっくり結論だけ：
+大きいオブジェクト（数百MB〜GB級）なら、boto3の並列マルチパートコピーに切り替えると2〜6倍、環境次第では8〜10倍速くなる余地があります。
+小さいファイルが大量のときは、boto3化そのものではなく並列度（スレッド数）で効きます（1.5〜3倍程度が目安）。
+
+⸻
+
+なぜ速くなる？
+	•	copy_object（MinIO SDK 単発）＝単一リクエスト/単一ストリーム。5GiB超は分割できず遅くなりがち。
+	•	boto3のTransferConfigはマルチパート＋並列でサーバ側コピーを走らせ、NICやディスク帯域を張り付かせやすい。
+
+⸻
+
+目安（10GbE・NVMe/RAID前提の感覚値）
+	•	単発コピーが~200〜300MB/sしか出ていない環境 → 並列8〜16で~800MB/s〜1.1GB/s（10GbE上限付近）まで伸びる＝3〜5倍。
+	•	25/40GbE＋速いNVMe → 1.5〜3GB/sも狙える＝5〜10倍（ボトルネックが他にない場合）。
+
+例：100GBを同一クラスタ内で“移動”
+	•	単発（250MB/s想定）: ~6分40秒
+	•	並列8（実効1.0GB/s想定）: ~1分40秒（4倍短縮）
+	•	並列16（実効1.8GB/s想定）: ~56秒（7倍短縮）
+
+実測は「ネットワーク上限」「MinIOノードのディスクI/O」「同時利用者数」で決まります。並列を上げても、どれかの天井で頭打ちになります。
+
+⸻
+
+すぐ試せるベンチ用スニペット（boto3並列コピー）
+	•	64MiB以上で分割、並列16の設定例。コピー完了後に元を削除＝実質“移動”。
+
+import time
+import boto3
+from boto3.s3.transfer import TransferConfig
+
+endpoint = "https://minio.example.local"
+ak = "MINIO_ACCESS_KEY"
+sk = "MINIO_SECRET_KEY"
+bucket = "my-bucket"
+src_key = "big/src.bin"
+dst_key = "big/dst.bin"
+
+s3 = boto3.resource(
+    "s3",
+    endpoint_url=endpoint,
+    aws_access_key_id=ak,
+    aws_secret_access_key=sk,
+    region_name="us-east-1",
+)
+
+cfg = TransferConfig(
+    multipart_threshold=64 * 1024 * 1024,   # 64MiB以上は分割
+    multipart_chunksize=64 * 1024 * 1024,   # 各パート64MiB
+    max_concurrency=16,                     # 並列度
+    use_threads=True,
+)
+
+start = time.time()
+obj = s3.Object(bucket, dst_key)
+obj.copy({"Bucket": bucket, "Key": src_key},
+         ExtraArgs={"MetadataDirective": "COPY"},
+         Config=cfg)
+s3.Object(bucket, src_key).delete()
+elapsed = time.time() - start
+
+size = s3.Object(bucket, dst_key).content_length
+throughput = size / elapsed / (1024**2)  # MB/s
+print(f"elapsed={elapsed:.1f}s, throughput={throughput:.1f} MB/s")
+
+チューニングの指針
+	•	max_concurrency: 8→16→32 と試して伸びが止まる値で止める
+	•	multipart_chunksize: 32〜128MiB。CPU/メモリ使用量と要相談
+	•	大量の小ファイルはキュー化＋ThreadPoolExecutorで「1オブジェクト＝1コピー」を並列投入（boto3でもMinIO SDKでも可）
+
+⸻
+
+どんなケースで伸びにくい？
+	•	同一ノード上の単一HDDなど、ディスクが早々に飽和する構成
+	•	1GbEなどネットワーク帯域が低い
+	•	同時に他ジョブがI/O/NICを占有している
+
+⸻
+
+まとめ
+	•	大きいファイル中心なら、boto3の並列マルチパートコピーで体感2〜6倍（良ければ8〜10倍）。
+	•	小さいファイル大量なら、SDKをboto3に換えるというより並列投入の設計が鍵。
+	•	実測がすべてなので、上のスニペットで**max_concurrencyを振って最速点を計測**するのがおすすめです。
+
+もし、対象の平均サイズ/最大サイズ/個数と回線・ディスク構成（1GbE/10GbE、HDD/SSD/NVMe、ノード数）を教えてくれれば、並列度・パートサイズの初期設定値を具体的に提案します。
+
+
+
+
