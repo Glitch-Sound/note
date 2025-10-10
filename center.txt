@@ -57,5 +57,91 @@ if __name__ == "__main__":
 	•	結果がギザつく場合は、centerline の segmentize_maxlen を小さめにする、または centerline.simplify(tolerance) を軽くかけると安定します。
 
 
+---
+
+① iPad（完全オフライン）
+
+技術要素
+Swift
+AVFoundation：カメラ
+Vision：オンデバイスOCR（VNRecognizeTextRequest）
+CoreImage：前処理（コントラスト/台形補正など）
+
+強み
+端末差が小さく安定、Neural Engineで高速、実装は比較的シンプル
+
+注意
+配布はTestFlight/MDM/Apple Business Managerを使うのが無難（若干手間）
+
+・220h
+
+・設計：40
+・実装：60
+・試験：30
+・精度：30
+・AWS：0
+・配布：30
+・管理：30
+
+
+
+
+
+② Android（完全オフライン）
+
+技術要素
+Kotlin/Java（← Kotrin → Kotlin に修正）
+CameraX：カメラ
+ML Kit Text Recognition：オンデバイスOCR
+※言語パックを依存関係で同梱（例：text-recognition-latin, text-recognition-japanese）すると初回DLなしで完全オフライン可
+OpenCV：前処理
+
+強み
+配布は柔軟（Playの社内配布/MDM/サイドロード）、機種選択でコスト最適化可
+
+注意
+機種差が精度に影響しやすい（タブレットはカメラ品質にばらつき大）。上位機種推奨
+
+
+・220h
+
+・設計：40
+・実装：80
+・試験：30
+・精度：30
+・AWS：0
+・配布：15
+・管理：25
+
+
+
+
+③ AWS連携（オンライン）
+
+技術要素
+言語：端末に依存（Swift または Kotlin/Java など）
+カメラ/前処理：端末側
+AWS：API Gateway + Lambda → Gemini Vision（OCR本体）
+（任意）S3保存、Cognito認証、CloudFront配信、Rekognition/Tesseractフォールバック
+
+強み
+精度は最有力（難条件に強い＆プロンプト制御可）。後処理もサーバ側で柔軟に実装可能
+
+注意
+運用コスト/レイテンシ/ネットワーク依存あり（ただしMVPなら十分現実的）
+
+
+・300h
+
+
+・設計：70
+・実装：60
+・試験：40
+・精度：40
+・AWS：40
+・配布：20
+・管理：30
+
+
 
 
