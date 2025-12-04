@@ -1,0 +1,18 @@
+[project]
+name = "uv-typer-sample"
+version = "0.1.0"
+description = "Minimal sample for uv + Typer"
+requires-python = ">=3.11"
+dependencies = [
+    "typer",
+]
+
+[tool.uv]
+package = true
+
+[project.scripts]
+uv-typer-sample = "uv_typer_sample.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
