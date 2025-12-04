@@ -1,0 +1,176 @@
+ユーザにドラッグさせて範囲指定（矩形選択）させる場合は、
+マウスイベントをフックして、自前で矩形 Polygon を更新する実装を行うのが一般的です。
+
+以下では：
+	•	Shift + ドラッグで矩形を描画
+	•	ドラッグ中は半透明の矩形を表示
+	•	マウスアップ時に選択範囲の bbox（西南・北東）を取得
+
+というパターンのサンプルを示します。
+
+⸻
+
+全体の考え方
+	1.	mousedown で「ドラッグ開始」判定（開始座標を記録・dragPan を無効化）
+	2.	mousemove で現在位置と開始位置から矩形 Polygon を生成し、GeoJSON Source に setData
+	3.	mouseup でドラッグ終了、bbox を計算して利用（API 呼び出しや絞り込みなど）、dragPan を再度有効化
+
+⸻
+
+サンプルコード（MapLibre GL JS）
+
+import maplibregl from 'maplibre-gl';
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://demotiles.maplibre.org/style.json',
+  center: [139.70, 35.68],
+  zoom: 12
+});
+
+let isDrawing = false;
+let startLngLat = null;
+
+map.on('load', () => {
+  // 矩形用の空 GeoJSON ソースを用意
+  map.addSource('drag-rect', {
+    type: 'geojson',
+    data: {
+      type: 'FeatureCollection',
+      features: []
+    }
+  });
+
+  // 塗り
+  map.addLayer({
+    id: 'drag-rect-fill',
+    type: 'fill',
+    source: 'drag-rect',
+    paint: {
+      'fill-color': '#ff0000',
+      'fill-opacity': 0.2
+    }
+  });
+
+  // 枠線
+  map.addLayer({
+    id: 'drag-rect-line',
+    type: 'line',
+    source: 'drag-rect',
+    paint: {
+      'line-color': '#ff0000',
+      'line-width': 2
+    }
+  });
+
+  // Shift + 左クリックで矩形描画開始
+  map.on('mousedown', (e) => {
+    // 例: Shift キーを押しているときだけ矩形描画モードにする
+    if (!e.originalEvent.shiftKey) {
+      return;
+    }
+
+    e.preventDefault();
+
+    isDrawing = true;
+    startLngLat = e.lngLat;
+
+    // マップのドラッグパンを一時的に無効化
+    map.dragPan.disable();
+    map.getCanvas().style.cursor = 'crosshair';
+  });
+
+  map.on('mousemove', (e) => {
+    if (!isDrawing || !startLngLat) return;
+
+    const current = e.lngLat;
+    const rectFeature = createRectangleFeature(startLngLat, current);
+
+    const source = map.getSource('drag-rect');
+    if (source) {
+      source.setData({
+        type: 'FeatureCollection',
+        features: [rectFeature]
+      });
+    }
+  });
+
+  map.on('mouseup', (e) => {
+    if (!isDrawing) return;
+    isDrawing = false;
+
+    map.dragPan.enable();
+    map.getCanvas().style.cursor = '';
+
+    const endLngLat = e.lngLat;
+    const bbox = calcBbox(startLngLat, endLngLat);
+
+    // ここで bbox を利用して API に投げる・レイヤをフィルタする等の処理
+    console.log('selected bbox:', bbox);
+    // bbox: [[minLng, minLat], [maxLng, maxLat]]
+
+    // 必要であれば選択矩形を消す場合：
+    // const source = map.getSource('drag-rect');
+    // source.setData({ type: 'FeatureCollection', features: [] });
+
+    startLngLat = null;
+  });
+
+  // マウスがキャンバスの外に出たときの保険
+  map.getCanvas().addEventListener('mouseleave', () => {
+    if (!isDrawing) return;
+    isDrawing = false;
+    map.dragPan.enable();
+    map.getCanvas().style.cursor = '';
+    startLngLat = null;
+  });
+});
+
+// start と end から矩形 Polygon Feature を作る
+function createRectangleFeature(p1, p2) {
+  const minLng = Math.min(p1.lng, p2.lng);
+  const maxLng = Math.max(p1.lng, p2.lng);
+  const minLat = Math.min(p1.lat, p2.lat);
+  const maxLat = Math.max(p1.lat, p2.lat);
+
+  return {
+    type: 'Feature',
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[
+        [minLng, minLat],
+        [maxLng, minLat],
+        [maxLng, maxLat],
+        [minLng, maxLat],
+        [minLng, minLat]  // 必ず始点に戻す
+      ]]
+    },
+    properties: {}
+  };
+}
+
+// bbox を返すユーティリティ
+function calcBbox(p1, p2) {
+  const minLng = Math.min(p1.lng, p2.lng);
+  const maxLng = Math.max(p1.lng, p2.lng);
+  const minLat = Math.min(p1.lat, p2.lat);
+  const maxLat = Math.max(p1.lat, p2.lat);
+
+  // [[西, 南], [東, 北]] の形にしておくと他ライブラリとも相性が良い
+  return [[minLng, minLat], [maxLng, maxLat]];
+}
+
+
+⸻
+
+実装上のポイント
+	•	ドラッグパンとの競合回避
+	•	矩形描画中は map.dragPan.disable() / 終了時に map.dragPan.enable()。
+	•	モディファイアキー（Shift / Ctrl など）を使うと通常操作との切り替えがわかりやすいです。
+	•	UI のわかりやすさ
+	•	cursor: crosshair にして「選択モード」であることを視覚的に示す。
+	•	選択終了後に矩形を残すか消すかは用途次第（フィルタ範囲を常に見せたいかどうか）。
+	•	選択結果の使い道
+	•	取得した bbox でサーバ検索・レイヤフィルタ・別 API 呼び出しなどに利用できます。
+	•	他ライブラリ（例えば Turf.js）を使うなら、turf.bboxPolygon(bbox) 等も活用可能です。
+
