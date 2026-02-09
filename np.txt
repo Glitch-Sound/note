@@ -2,12 +2,20 @@ import numpy as np
 
 def low_outlier_threshold(
     values,
-    ratio_thresh=3.0,   # 「十分大きい段差」の定義
+    ratio_thresh=3.0,   # 「異常な段差」とみなす倍率
     trim_frac=0.8,      # 上位を無視する割合
-    min_keep=3
+    min_keep=3,         # 段差判定に使う最小個数
+    min_valid=50        # 最小値がこれ以上なら閾値なし
 ):
     a = np.asarray(values, dtype=float)
     a = a[np.isfinite(a)]
+    if a.size == 0:
+        return 0
+
+    # 条件①：最小値が一定以上なら除外なし
+    if a.min() >= min_valid:
+        return 0
+
     if a.size < 2:
         return float(a.max())
 
@@ -24,7 +32,7 @@ def low_outlier_threshold(
     # 「十分大きい」最初の段差
     idx = np.where(r >= ratio_thresh)[0]
     if idx.size == 0:
-        return float(t[0])  # 見つからなければ何も除外しない寄り
+        return 0  # 段差がなければ除外なし
 
     k = int(idx[0])
     return float(t[k])
