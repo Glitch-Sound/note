@@ -1,0 +1,39 @@
+import numpy as np
+
+def low_outlier_threshold(values, keep_frac=0.8, min_keep=3):
+    """
+    小さい側の外れ値群を除外するための閾値（この値以下を除外）を返す。
+    - 極端に大きい値は無視したいので、上位(1-keep_frac)をトリムして段差検出する。
+    - 段差は隣接比(次/前)のlogで評価（スケールに強い）。
+    """
+    a = np.asarray(values, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        raise ValueError("values is empty or non-finite only")
+
+    s = np.sort(a)
+    if s.size < 2:
+        return float(s[-1])  # 1点ならそれが閾値
+
+    # 上位を無視（トリム）
+    n_keep = int(np.ceil(s.size * keep_frac))
+    n_keep = max(min_keep, min(n_keep, s.size))
+    t = s[:n_keep]
+
+    # 0や同値で割りが壊れないように、比ではなく log差 (log(t[i+1]) - log(t[i])) を使う
+    # tが0以下を含むとlog不可なので、その場合は「隣接差」にフォールバック
+    if np.all(t > 0):
+        g = np.diff(np.log(t))   # = log(t[i+1]/t[i])
+    else:
+        g = np.diff(t)           # フォールバック（単位依存）
+
+    if g.size == 0:
+        return float(t[-1])
+
+    k = int(np.argmax(g))        # 最大ジャンプ位置
+    threshold = float(t[k])      # ジャンプ直前が「小さい群の上限」
+    return threshold
+
+
+
+
