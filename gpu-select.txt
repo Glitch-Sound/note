@@ -1,40 +1,70 @@
-PyTorch では torch.cuda.get_device_properties(device) で GPU 情報を取得でき、返る _CudaDeviceProperties には uuid が含まれます。公式の PyTorch ドキュメント例にも uuid=... を含む出力例があります。 ￼
-
-たとえばこうです。
-
-
----
-
+import subprocess
 import torch
 
-def resolve_gpu_index_by_uuid(target_uuid: str) -> int:
-    target = target_uuid.lower().replace("gpu-", "").strip()
 
-    for idx in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(idx)
-        # props.uuid は "3a6a8555-..." のような形で返る想定
-        current = str(props.uuid).lower().replace("gpu-", "").strip()
-        if current == target:
+def list_gpus_by_nvidia_smi() -> list[tuple[int, str]]:
+    """
+    戻り値:
+        [(0, "GPU-xxxx"), (1, "GPU-yyyy"), ...]
+    """
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+
+    rows: list[tuple[int, str]] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # 例: "0, GPU-112210d9-2c0f-42a4-e85f-b4338c9c1d85"
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) != 2:
+            raise ValueError(f"Unexpected nvidia-smi output line: {line}")
+
+        idx_str, uuid = parts
+        rows.append((int(idx_str), uuid))
+
+    return rows
+
+
+def resolve_gpu_index_by_uuid(target_uuid: str) -> int:
+    normalized = target_uuid.strip().lower()
+    if not normalized.startswith("gpu-"):
+        normalized = f"gpu-{normalized}"
+
+    for idx, uuid in list_gpus_by_nvidia_smi():
+        current = uuid.strip().lower()
+        if current == normalized:
             return idx
 
-    raise ValueError(f"GPU UUID not found: {target_uuid}")
+    raise ValueError(f"GPU UUID not found in container: {target_uuid}")
+
 
 def get_torch_device_by_uuid(target_uuid: str) -> torch.device:
     idx = resolve_gpu_index_by_uuid(target_uuid)
     return torch.device(f"cuda:{idx}")
+
+
+
 
 ---
 
 
 使い方
 
----
-
-gpu_uuid = "GPU-3a6a8555-efc9-d0dc-972b-36624af6fad8"
+gpu_uuid = "GPU-112210d9-2c0f-42a4-e85f-b4338c9c1d85"
 device = get_torch_device_by_uuid(gpu_uuid)
 
 model = model.to(device)
 x = x.to(device)
-
 
 
