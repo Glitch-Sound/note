@@ -67,4 +67,19 @@ device = get_torch_device_by_uuid(gpu_uuid)
 model = model.to(device)
 x = x.to(device)
 
+---
+
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+
+from ultralytics import RTDETR
+
+gpu_index = resolve_gpu_index_by_uuid(gpu_uuid)
+
+model = RTDETR("rtdetr-l.pt")
+results = model.train(
+    data="dataset.yaml",
+    epochs=100,
+    device=gpu_index,
+)
 
