@@ -1,0 +1,40 @@
+PyTorch では torch.cuda.get_device_properties(device) で GPU 情報を取得でき、返る _CudaDeviceProperties には uuid が含まれます。公式の PyTorch ドキュメント例にも uuid=... を含む出力例があります。 ￼
+
+たとえばこうです。
+
+
+---
+
+import torch
+
+def resolve_gpu_index_by_uuid(target_uuid: str) -> int:
+    target = target_uuid.lower().replace("gpu-", "").strip()
+
+    for idx in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(idx)
+        # props.uuid は "3a6a8555-..." のような形で返る想定
+        current = str(props.uuid).lower().replace("gpu-", "").strip()
+        if current == target:
+            return idx
+
+    raise ValueError(f"GPU UUID not found: {target_uuid}")
+
+def get_torch_device_by_uuid(target_uuid: str) -> torch.device:
+    idx = resolve_gpu_index_by_uuid(target_uuid)
+    return torch.device(f"cuda:{idx}")
+
+---
+
+
+使い方
+
+---
+
+gpu_uuid = "GPU-3a6a8555-efc9-d0dc-972b-36624af6fad8"
+device = get_torch_device_by_uuid(gpu_uuid)
+
+model = model.to(device)
+x = x.to(device)
+
+
+
